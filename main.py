@@ -90,6 +90,85 @@ def _write_bootstrap_log(message: str):
         pass
 
 
+def _start_console_hide_watcher():
+    if sys.platform != "win32":
+        return None, None
+    try:
+        import threading
+        import ctypes
+    except Exception:
+        return None, None
+    stop_event = threading.Event()
+    try:
+        u32 = ctypes.windll.user32
+    except Exception:
+        return None, None
+
+    def _is_descendant(pid: int, root_pid: int) -> bool:
+        if pid <= 0:
+            return False
+        if pid == root_pid:
+            return True
+        try:
+            import psutil
+        except Exception:
+            return False
+        try:
+            p = psutil.Process(int(pid))
+        except Exception:
+            return False
+        for _ in range(20):
+            try:
+                if p.pid == root_pid:
+                    return True
+                p = p.parent()
+            except Exception:
+                break
+            if p is None:
+                break
+        return False
+
+    def _hide_console_windows_for_children() -> None:
+        root_pid = os.getpid()
+
+        def _enum_proc(hwnd, _lparam):
+            try:
+                class_name = ctypes.create_unicode_buffer(256)
+                if u32.GetClassNameW(hwnd, class_name, 256) == 0:
+                    return True
+                if class_name.value != "ConsoleWindowClass":
+                    return True
+                pid = ctypes.c_ulong()
+                u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                if not _is_descendant(int(pid.value or 0), root_pid):
+                    return True
+                try:
+                    u32.ShowWindow(hwnd, 0)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            return True
+
+        try:
+            cb = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)(_enum_proc)
+            u32.EnumWindows(cb, 0)
+        except Exception:
+            pass
+
+    def _loop():
+        while not stop_event.is_set():
+            try:
+                _hide_console_windows_for_children()
+            except Exception:
+                pass
+            stop_event.wait(0.3)
+
+    th = threading.Thread(target=_loop, daemon=True)
+    th.start()
+    return stop_event, th
+
+
 class ScreenTranslatorApp:
     """屏幕翻译应用程序主类"""
     
@@ -100,6 +179,7 @@ class ScreenTranslatorApp:
         self._install_crash_logger()
         _enable_windows_per_monitor_dpi_awareness()
         self._ensure_qt_plugin_paths()
+        self._console_hide_stop, self._console_hide_thread = _start_console_hide_watcher()
 
         # Delay imports so that we can log failures (e.g. missing Qt DLLs) into bootstrap.log/crash.log.
         try:
@@ -533,6 +613,11 @@ class ScreenTranslatorApp:
     def cleanup(self):
         """清理资源"""
         self.logger.info("正在清理资源...")
+        try:
+            if getattr(self, "_console_hide_stop", None) is not None:
+                self._console_hide_stop.set()
+        except Exception:
+            pass
         
         # 停止快捷键监听
         if self.hotkey_manager:

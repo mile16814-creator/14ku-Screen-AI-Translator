@@ -3088,10 +3088,25 @@ class MainWindow(QMainWindow):
 
     def _is_32bit_python_cmd(self, cmd: list[str]) -> bool:
         try:
+            startupinfo = None
+            creationflags = 0
+            if os.name == "nt":
+                try:
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0
+                except Exception:
+                    startupinfo = None
+                try:
+                    creationflags |= subprocess.CREATE_NO_WINDOW
+                except Exception:
+                    pass
             result = subprocess.run(
                 cmd + ["-c", "import struct,sys;sys.exit(0 if struct.calcsize('P')==4 else 1)"],
                 capture_output=True,
                 timeout=2,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
             )
             return result.returncode == 0
         except Exception:

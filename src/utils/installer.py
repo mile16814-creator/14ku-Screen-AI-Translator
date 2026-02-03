@@ -180,7 +180,24 @@ class Installer:
             $Shortcut.IconLocation = "{target_path}"
             $Shortcut.Save()
             """
-            subprocess.run(["powershell", "-Command", ps_script], capture_output=True)
+            startupinfo = None
+            creationflags = 0
+            if os.name == "nt":
+                try:
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0
+                except Exception:
+                    startupinfo = None
+                try:
+                    creationflags |= subprocess.CREATE_NO_WINDOW
+                except Exception:
+                    pass
+            subprocess.run(
+                ["powershell", "-Command", ps_script],
+                capture_output=True,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+            )
         except Exception:
             pass
-

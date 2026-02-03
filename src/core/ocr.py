@@ -227,6 +227,50 @@ class OCRProcessor:
             except Exception:
                 pass
 
+    def _run_tesseract_stdout(self, image: Image.Image, config: str) -> str:
+        tesseract_cmd = pytesseract.pytesseract.tesseract_cmd or "tesseract"
+        tmp = tempfile.NamedTemporaryFile(suffix=".png", dir=str(self.temp_dir), delete=False)
+        tmp_path = Path(tmp.name)
+        tmp.close()
+
+        try:
+            image.save(tmp_path)
+            cfg_args = shlex.split(str(config or ""), posix=False)
+            args = [tesseract_cmd, str(tmp_path), "stdout", *cfg_args]
+
+            extra_run_kwargs = {}
+            if os.name == "nt":
+                try:
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = getattr(subprocess, "SW_HIDE", 0)
+                    extra_run_kwargs["startupinfo"] = startupinfo
+                except Exception:
+                    pass
+                try:
+                    extra_run_kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                except Exception:
+                    pass
+
+            result = subprocess.run(
+                args,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                **extra_run_kwargs,
+            )
+
+            if result.returncode != 0:
+                stderr_text = self._decode_tesseract_bytes(result.stderr)
+                raise RuntimeError(stderr_text.strip() or f"tesseract 退出码 {result.returncode}")
+
+            return self._decode_tesseract_bytes(result.stdout)
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
     def _tsv_text_to_data_dict(self, tsv_text: str) -> dict:
         lines = [ln for ln in (tsv_text or "").splitlines() if ln.strip()]
         if not lines:
@@ -247,6 +291,8 @@ class OCRProcessor:
         return out
 
     def _safe_image_to_data(self, image: Image.Image, config: str) -> dict:
+        if os.name == "nt":
+            return self._run_tesseract_tsv(image, config=config)
         try:
             return pytesseract.image_to_data(
                 image,
@@ -1208,7 +1254,7 @@ class OCRProcessor:
                             # 强制保留词间空格（对英文非常关键）
                             config = f'--oem {oem} --psm {psm} -l {ocr_language} -c preserve_interword_spaces=1'
                             # 使用 image_to_string 获取原始文本
-                            raw_text = pytesseract.image_to_string(img_to_use, config=config)
+                            raw_text = self._run_tesseract_stdout(img_to_use, config=config)
                             
                             if raw_text and raw_text.strip():
                                 has_space = ' ' in raw_text

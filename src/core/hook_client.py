@@ -98,6 +98,35 @@ def hook_log(message: str) -> None:
         pass
 
 
+def _ensure_hidden_console_for_console_children() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+    except Exception:
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        u32 = ctypes.windll.user32
+    except Exception:
+        return
+    try:
+        hwnd = k32.GetConsoleWindow()
+        if int(hwnd or 0) == 0:
+            try:
+                k32.AllocConsole()
+            except Exception:
+                return
+            hwnd = k32.GetConsoleWindow()
+        if int(hwnd or 0) != 0:
+            try:
+                u32.ShowWindow(hwnd, 0)
+            except Exception:
+                pass
+    except Exception:
+        return
+
+
 class HookTextThread(QThread):
     text_received = pyqtSignal(str)
     status = pyqtSignal(str)
@@ -492,6 +521,10 @@ class HookTextThread(QThread):
     def _frida_loop(self) -> None:
         try:
             self.status.emit("Hook Frida 线程运行中")
+        except Exception:
+            pass
+        try:
+            _ensure_hidden_console_for_console_children()
         except Exception:
             pass
         try:

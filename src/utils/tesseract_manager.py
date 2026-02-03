@@ -66,12 +66,14 @@ class TesseractManager:
             return None
         
         try:
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             result = subprocess.run(
                 [str(self.tesseract_exe), "--version"],
                 capture_output=True,
                 text=True,
                 encoding='utf-8',
-                errors='ignore'
+                errors='ignore',
+                creationflags=creationflags,
             )
             if result.returncode == 0:
                 # 提取版本信息
