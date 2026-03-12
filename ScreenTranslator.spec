@@ -79,7 +79,7 @@ a = Analysis(
         # pyautogui is not used (previously imported accidentally) and may pull in tkinter/Tcl.
         'pyautogui', 'pyscreeze', 'pymsgbox', 'mouseinfo', 'PIL.ImageTk',
         # Build/packaging helpers not needed at runtime
-        'setuptools', 'pkg_resources', 'distutils',
+        'setuptools', 'pkg_resources',
     ],
     noarchive=False,
     optimize=0,
@@ -115,5 +115,5 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name='ScreenTranslator',
+    name='ScreenTranslator-x64',
 )

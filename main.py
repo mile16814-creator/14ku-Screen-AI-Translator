@@ -103,33 +103,116 @@ def _start_console_hide_watcher():
         u32 = ctypes.windll.user32
     except Exception:
         return None, None
+    try:
+        k32 = ctypes.windll.kernel32
+        import ctypes.wintypes as wt
+    except Exception:
+        k32 = None
+        wt = None
 
-    def _is_descendant(pid: int, root_pid: int) -> bool:
-        if pid <= 0:
-            return False
-        if pid == root_pid:
-            return True
+    def _build_parent_pid_map() -> dict[int, int] | None:
+        if k32 is None or wt is None:
+            return None
         try:
-            import psutil
-        except Exception:
-            return False
-        try:
-            p = psutil.Process(int(pid))
-        except Exception:
-            return False
-        for _ in range(20):
+            TH32CS_SNAPPROCESS = 0x00000002
+
+            class PROCESSENTRY32W(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wt.DWORD),
+                    ("cntUsage", wt.DWORD),
+                    ("th32ProcessID", wt.DWORD),
+                    ("th32DefaultHeapID", wt.ULONG_PTR),
+                    ("th32ModuleID", wt.DWORD),
+                    ("cntThreads", wt.DWORD),
+                    ("th32ParentProcessID", wt.DWORD),
+                    ("pcPriClassBase", wt.LONG),
+                    ("dwFlags", wt.DWORD),
+                    ("szExeFile", wt.WCHAR * 260),
+                ]
+
+            k32.CreateToolhelp32Snapshot.argtypes = [wt.DWORD, wt.DWORD]
+            k32.CreateToolhelp32Snapshot.restype = wt.HANDLE
+            k32.Process32FirstW.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+            k32.Process32FirstW.restype = wt.BOOL
+            k32.Process32NextW.argtypes = [wt.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+            k32.Process32NextW.restype = wt.BOOL
+            k32.CloseHandle.argtypes = [wt.HANDLE]
+            k32.CloseHandle.restype = wt.BOOL
+
+            snap = k32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if not snap or snap == wt.HANDLE(-1).value:
+                return None
+
+            parent_map: dict[int, int] = {}
             try:
-                if p.pid == root_pid:
-                    return True
-                p = p.parent()
-            except Exception:
-                break
-            if p is None:
-                break
-        return False
+                entry = PROCESSENTRY32W()
+                entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+                if not k32.Process32FirstW(snap, ctypes.byref(entry)):
+                    return None
+                while True:
+                    pid = int(entry.th32ProcessID or 0)
+                    ppid = int(entry.th32ParentProcessID or 0)
+                    if pid > 0:
+                        parent_map[pid] = ppid
+                    if not k32.Process32NextW(snap, ctypes.byref(entry)):
+                        break
+            finally:
+                try:
+                    k32.CloseHandle(snap)
+                except Exception:
+                    pass
+            return parent_map
+        except Exception:
+            return None
 
     def _hide_console_windows_for_children() -> None:
         root_pid = os.getpid()
+        parent_map: dict[int, int] | None = None
+        psutil_mod = None
+
+        def _is_descendant(pid: int) -> bool:
+            nonlocal parent_map, psutil_mod
+            if pid <= 0:
+                return False
+            if pid == root_pid:
+                return True
+
+            if parent_map is None:
+                parent_map = _build_parent_pid_map()
+                if parent_map is None:
+                    parent_map = {}
+                    try:
+                        import psutil as _psutil  # type: ignore
+                        psutil_mod = _psutil
+                    except Exception:
+                        psutil_mod = None
+
+            if parent_map:
+                cur = pid
+                for _ in range(64):
+                    if cur == root_pid:
+                        return True
+                    cur = int(parent_map.get(int(cur), 0) or 0)
+                    if cur <= 0:
+                        return False
+                return False
+
+            if psutil_mod is None:
+                return False
+            try:
+                p = psutil_mod.Process(int(pid))
+            except Exception:
+                return False
+            for _ in range(32):
+                try:
+                    if p.pid == root_pid:
+                        return True
+                    p = p.parent()
+                except Exception:
+                    break
+                if p is None:
+                    break
+            return False
 
         def _enum_proc(hwnd, _lparam):
             try:
@@ -140,7 +223,7 @@ def _start_console_hide_watcher():
                     return True
                 pid = ctypes.c_ulong()
                 u32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-                if not _is_descendant(int(pid.value or 0), root_pid):
+                if not _is_descendant(int(pid.value or 0)):
                     return True
                 try:
                     u32.ShowWindow(hwnd, 0)
@@ -162,7 +245,7 @@ def _start_console_hide_watcher():
                 _hide_console_windows_for_children()
             except Exception:
                 pass
-            stop_event.wait(0.3)
+            stop_event.wait(0.05)
 
     th = threading.Thread(target=_loop, daemon=True)
     th.start()
@@ -220,7 +303,7 @@ class ScreenTranslatorApp:
 
         self.app = QApplication(sys.argv)
         self.app.setApplicationName("屏幕翻译工具")
-        self.app.setApplicationVersion("1.0.0")
+        self.app.setApplicationVersion("2.0.0")
 
         # 尝试加载 Qt 自带中文翻译包（用于 QColorDialog 等标准控件的中文化）
         self._qt_translators = []
@@ -293,8 +376,8 @@ class ScreenTranslatorApp:
             else:
                 candidates.extend(
                     [
-                        resource_root / "dist" / "ScreenTranslator" / "_internal" / "PyQt6" / "Qt6",
-                        app_root / "dist" / "ScreenTranslator" / "_internal" / "PyQt6" / "Qt6",
+                        resource_root / "dist" / "ScreenTranslator-x64" / "_internal" / "PyQt6" / "Qt6",
+                        app_root / "dist" / "ScreenTranslator-x64" / "_internal" / "PyQt6" / "Qt6",
                     ]
                 )
 
@@ -400,8 +483,21 @@ class ScreenTranslatorApp:
             else:
                 model_path = None  # 让LocalAITranslator自己查找
             try:
-                self.translator = LocalAITranslator(model_path)
-                self.logger.info(f"本地AI翻译器初始化成功，模型路径: {self.translator.model_path}")
+                use_cpu = self.config_manager.get_bool('local_model', 'use_cpu', False)
+                use_fp16 = self.config_manager.get_bool('local_model', 'use_fp16', True)
+                gpu_frac = self.config_manager.get_float('local_model', 'gpu_memory_fraction', 0.5)
+                num_beams = self.config_manager.get_int('local_model', 'num_beams', 1)
+                self.translator = LocalAITranslator(
+                    model_path,
+                    use_cpu=use_cpu,
+                    use_fp16=use_fp16,
+                    gpu_memory_fraction=gpu_frac,
+                    num_beams=num_beams,
+                )
+                self.logger.info(
+                    f"本地AI翻译器初始化成功，模型路径: {self.translator.model_path} "
+                    f"(CPU={use_cpu}, fp16={use_fp16}, GPU限制={gpu_frac}, beams={num_beams})"
+                )
             except Exception as e:
                 self.logger.error(f"本地AI翻译器初始化失败: {e}")
                 raise

@@ -38,7 +38,7 @@ class ConfigManager:
                 'target_process': '',
                 'auto_start': 'false',
                 'py32': '',
-                'prefer_frida_only': 'true',
+                'prefer_frida_only': 'false',
             },
             'translation': {
                 'source_language': 'auto',
@@ -102,6 +102,13 @@ class ConfigManager:
                 'timeout': '10',
                 # 启动时自动登录（仅使用设备ID，静默请求；失败不影响使用）
                 'auto_login': 'true',
+            },
+            'api': {
+                'enabled': 'false',
+                'base_url': '',
+                'api_key': '',
+                'model': '',
+                'models': '[]',
             },
         }
         

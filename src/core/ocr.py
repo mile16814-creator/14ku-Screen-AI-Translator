@@ -41,6 +41,7 @@ class OCRProcessor:
     def __init__(self, languages: str = "eng+jpn+kor"):
         self.logger = logging.getLogger(__name__)
         self.languages = languages
+        self._available_tesseract_langs_cache: Optional[set] = None
         self.temp_dir = Path(tempfile.gettempdir()) / "screen_translator_ocr"
         self.temp_dir.mkdir(exist_ok=True)
         
@@ -106,17 +107,8 @@ class OCRProcessor:
         self._last_composited_for_ocr: Optional[Image.Image] = None
 
     def _get_available_tesseract_languages_set(self) -> set:
-        langs = None
-        try:
-            langs = pytesseract.get_languages(config="")
-        except Exception:
-            langs = None
-
-        if langs:
-            try:
-                return {str(x).strip() for x in langs if str(x).strip()}
-            except Exception:
-                pass
+        if self._available_tesseract_langs_cache:
+            return set(self._available_tesseract_langs_cache)
 
         tessdata_dir = None
         try:
@@ -141,9 +133,23 @@ class OCRProcessor:
         except Exception:
             pass
 
+        if not out and os.name != "nt":
+            langs = None
+            try:
+                langs = pytesseract.get_languages(config="")
+            except Exception:
+                langs = None
+
+            if langs:
+                try:
+                    out = {str(x).strip() for x in langs if str(x).strip()}
+                except Exception:
+                    out = set()
+
         if not out:
             out.add("eng")
-        return out
+        self._available_tesseract_langs_cache = set(out)
+        return set(out)
 
     def _filter_ocr_language_to_available(self, language: str) -> str:
         parts = [p.strip() for p in str(language or "").split("+") if p.strip()]

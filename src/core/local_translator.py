@@ -4,6 +4,7 @@
 
 import os
 import logging
+import gc
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,17 +12,51 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, pyqtSignal
 
 # 延迟导入transformers，避免启动时立即加载模型
+_TRANSFORMERS_IMPORT_ERROR = None
 try:
     from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+    try:
+        from transformers import GenerationConfig
+    except ImportError:
+        GenerationConfig = None
     TRANSFORMERS_AVAILABLE = True
-except ImportError:
+except Exception as ex:
     TRANSFORMERS_AVAILABLE = False
+    _TRANSFORMERS_IMPORT_ERROR = ex
 
+
+def _apply_transformers_type_hints_patch():
+    """
+    修复 Python 3.13+ 下 transformers 的 get_type_hints 错误：
+    "type 'typing.TypeVar' is not an acceptable base type"
+    在模型类加载前应用此补丁。
+    """
+    try:
+        import transformers.modeling_utils as mu
+        from typing import get_type_hints as _get_type_hints
+
+        def _safe_get_type_hints(obj, globalns=None, localns=None, include_extras=False):
+            try:
+                return _get_type_hints(obj, globalns, localns, include_extras)
+            except (TypeError, AttributeError):
+                return {}
+
+        mu.get_type_hints = _safe_get_type_hints
+    except Exception:
+        pass
+
+
+# Apply patch at import time (before any model loading)
+if TRANSFORMERS_AVAILABLE:
+    _apply_transformers_type_hints_patch()
+
+_TORCH_IMPORT_ERROR = None
 try:
     import torch
     TORCH_AVAILABLE = True
-except ImportError:
+except Exception as ex:
     TORCH_AVAILABLE = False
+    _TORCH_IMPORT_ERROR = ex
 
 
 @dataclass
@@ -38,22 +73,47 @@ class TranslationResult:
 class LocalAITranslator:
     """本地AI翻译器 - 使用M2M100/NLLB模型"""
     
-    def __init__(self, model_path: Optional[str] = None, load_model_immediately: bool = True):
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        load_model_immediately: bool = True,
+        *,
+        use_cpu: bool = False,
+        use_fp16: bool = False,
+        gpu_memory_fraction: float = 0.5,
+        num_beams: int = 1,
+    ):
         """
         初始化本地AI翻译器
         
         Args:
             model_path: 模型路径，如果为None则使用默认的models目录
             load_model_immediately: 是否立即加载模型（默认True，让模型常驻内存）
+            use_cpu: 强制使用CPU，避免占用GPU显存
+            use_fp16: 使用半精度减少显存约50%
+            gpu_memory_fraction: 限制GPU显存使用比例(0.0-1.0)
+            num_beams: 束搜索宽度，1=贪婪解码最省显存
         """
         from src.exceptions import ModelError, FileError
         
         if not TRANSFORMERS_AVAILABLE:
-            raise ModelError("transformers库未安装，请运行: pip install transformers", error_code=501)
+            detail = f"（导入异常: {_TRANSFORMERS_IMPORT_ERROR}）" if _TRANSFORMERS_IMPORT_ERROR else ""
+            raise ModelError(
+                f"transformers库未安装或无法导入，请运行: pip install transformers{detail}",
+                error_code=501,
+            )
         if not TORCH_AVAILABLE:
-            raise ModelError("torch库未安装，请运行: pip install torch", error_code=502)
+            detail = f"（导入异常: {_TORCH_IMPORT_ERROR}）" if _TORCH_IMPORT_ERROR else ""
+            raise ModelError(
+                f"torch库未安装或无法导入，请运行: pip install torch{detail}",
+                error_code=502,
+            )
         
         self.logger = logging.getLogger(__name__)
+        self._use_cpu = use_cpu
+        self._use_fp16 = use_fp16
+        self._gpu_memory_fraction = max(0.01, min(1.0, gpu_memory_fraction))
+        self._num_beams = max(1, min(10, num_beams))
         
         # 确定模型路径
         if model_path is None:
@@ -99,12 +159,24 @@ class LocalAITranslator:
         self.tokenizer = None
         
         # 自动检测可用设备
-        # 优先使用 CUDA (NVIDIA GPU)，如果没有则使用 CPU
-        # 也可以检测 MPS (Apple Silicon)
-        if torch.cuda.is_available():
+        # use_cpu=True 时强制 CPU；否则优先 CUDA -> MPS -> CPU
+        if self._use_cpu:
+            self.device = "cpu"
+            self.logger.info("已配置强制使用 CPU（显存优化模式）")
+        elif torch.cuda.is_available():
             self.device = "cuda"
-            gpu_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "Unknown"
-            self.logger.info(f"检测到 NVIDIA GPU: {gpu_name}，使用 CUDA 加速")
+            # 在加载模型前限制显存使用比例，避免占满所有显存
+            try:
+                torch.cuda.set_per_process_memory_fraction(self._gpu_memory_fraction, 0)
+                gpu_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "Unknown"
+                self.logger.info(
+                    f"检测到 NVIDIA GPU: {gpu_name}，使用 CUDA 加速 "
+                    f"(显存限制: {self._gpu_memory_fraction*100:.0f}%)"
+                )
+            except Exception as e:
+                self.logger.warning(f"设置显存限制失败: {e}，将使用默认显存分配")
+                gpu_name = torch.cuda.get_device_name(0) if torch.cuda.device_count() > 0 else "Unknown"
+                self.logger.info(f"检测到 NVIDIA GPU: {gpu_name}，使用 CUDA 加速")
         elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
             # Apple Silicon (M1/M2/M3) GPU
             self.device = "mps"
@@ -147,6 +219,7 @@ class LocalAITranslator:
     def _load_model(self):
         """加载模型到内存（如果尚未加载）"""
         if self.model is None or self.tokenizer is None:
+            _apply_transformers_type_hints_patch()
             try:
                 from src.exceptions import ModelError, FileError, ScreenTranslatorError
                 import json
@@ -201,7 +274,16 @@ class LocalAITranslator:
                         details={"model_path": str(self.model_path), "original_error": str(ex)},
                     )
 
-                self.model = AutoModelForSeq2SeqLM.from_pretrained(model_path_str, trust_remote_code=True)
+                # 半精度可减少约50%显存
+                load_dtype = torch.float16 if self._use_fp16 and self.device != "cpu" else torch.float32
+                try:
+                    self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                        model_path_str, trust_remote_code=True, dtype=load_dtype
+                    )
+                except TypeError:
+                    self.model = AutoModelForSeq2SeqLM.from_pretrained(
+                        model_path_str, trust_remote_code=True, torch_dtype=load_dtype
+                    )
                 
                 # 将模型移动到指定设备
                 self.model.to(self.device)
@@ -554,26 +636,55 @@ class LocalAITranslator:
                 encoded = self.tokenizer(line, return_tensors="pt", padding=True, truncation=True, max_length=512)
                 encoded = {k: v.to(self.device) for k, v in encoded.items()}
                 
-                # 生成翻译
-                with torch.no_grad():
-                    generate_kwargs = {
-                        **encoded,
-                        'max_length': 512,
-                        'num_beams': 5,
-                        'early_stopping': True
-                    }
-                    # NLLB/M2M100 模型需要 forced_bos_token_id 来指定目标语言
+                # 使用 GenerationConfig 避免弃用警告（若库支持）
+                if GenerationConfig is not None:
+                    gen_cfg = GenerationConfig(
+                        max_length=512,
+                        num_beams=self._num_beams,
+                        early_stopping=(self._num_beams > 1),
+                    )
                     if forced_bos_token_id is not None:
-                        generate_kwargs['forced_bos_token_id'] = forced_bos_token_id
-                    
-                    generated_tokens = self.model.generate(**generate_kwargs)
+                        gen_cfg.forced_bos_token_id = int(forced_bos_token_id)
+                    def _do_generate():
+                        with torch.no_grad():
+                            return self.model.generate(**encoded, generation_config=gen_cfg)
+                else:
+                    def _do_generate():
+                        with torch.no_grad():
+                            kw = {**encoded, "max_length": 512, "num_beams": self._num_beams}
+                            if self._num_beams > 1:
+                                kw["early_stopping"] = True
+                            if forced_bos_token_id is not None:
+                                kw["forced_bos_token_id"] = int(forced_bos_token_id)
+                            return self.model.generate(**kw)
+
+                try:
+                    generated_tokens = _do_generate()
+                except Exception as fp16_ex:
+                    if self._use_fp16 and self.device != "cpu" and next(self.model.parameters()).dtype == torch.float16:
+                        self.logger.warning(f"fp16 生成失败，改用 fp32 重试: {fp16_ex}")
+                        self.model.float()
+                        try:
+                            generated_tokens = _do_generate()
+                        finally:
+                            self.model.half()
+                    else:
+                        raise
                 
-                # 解码翻译结果
                 translated_line = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)[0]
-                translated_lines.append(translated_line)
+                translated_lines.append(translated_line or "")
             
             # 用换行符连接所有翻译结果，保持原文排版
             translated_text = '\n'.join(translated_lines)
+            # 若模型未产生任何有效输出，返回明确错误
+            if not translated_text or not translated_text.strip():
+                return TranslationResult(
+                    original_text=text,
+                    translated_text="",
+                    source_lang=source_lang,
+                    target_lang=target_lang,
+                    error="模型未产生输出，请确认目标语言在模型支持列表中（如 en/zh/ja/ko）"
+                )
             
             return TranslationResult(
                 original_text=text,
@@ -584,13 +695,16 @@ class LocalAITranslator:
             )
             
         except Exception as e:
+            err_msg = str(e).strip() if str(e) else repr(e)
+            if not err_msg:
+                err_msg = f"{type(e).__name__}(详见日志)"
             self.logger.error(f"翻译失败: {e}", exc_info=True)
             return TranslationResult(
                 original_text=text,
                 translated_text="",
                 source_lang=source_lang,
                 target_lang=target_lang,
-                error=f"翻译失败: {str(e)}"
+                error=f"翻译失败: {err_msg}"
             )
     
     def translate_texts(
@@ -643,6 +757,27 @@ class LocalAITranslator:
     def get_usage(self) -> Tuple[Optional[int], Optional[int], Optional[str]]:
         """获取使用情况（本地模型不需要API配额）"""
         return None, None, "本地AI模型，无使用限制"
+
+    def unload_model(self) -> None:
+        try:
+            self.model = None
+            self.tokenizer = None
+        except Exception:
+            pass
+        try:
+            if TORCH_AVAILABLE:
+                import torch
+                if str(getattr(self, "device", "") or "").lower() == "cuda":
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            gc.collect()
+        except Exception:
+            pass
     
     def test_connection(self) -> Tuple[bool, str]:
         """测试模型连接"""
@@ -711,4 +846,3 @@ class LocalTranslationThread(QThread):
         # 完成
         self.progress.emit(100, "翻译完成")
         self.finished.emit(self.results)
-

@@ -1,4 +1,7 @@
-# 屏幕翻译工具依赖包
+﻿# 屏幕翻译工具依赖包
+# Python 3.12+ 下 typing-extensions 过旧会在导入时报错：
+# "type 'typing.TypeVar' is not an acceptable base type"
+typing-extensions>=4.12.2,<5.0.0
 PyQt6>=6.5.0
 pillow>=10.0.0
 pytesseract>=0.3.10

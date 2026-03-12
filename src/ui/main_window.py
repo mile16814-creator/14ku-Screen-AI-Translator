@@ -10,6 +10,7 @@ import tempfile
 import shutil
 import logging
 import time
+from collections import deque
 from pathlib import Path
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -21,6 +22,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QFileDialog,
     QColorDialog,
+    QInputDialog,
     QDialog,
     QToolButton,
     QSizePolicy,
@@ -31,7 +33,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
 )
-from PyQt6.QtCore import Qt, QRect, QThread, pyqtSignal, QTimer, QBuffer, QIODevice, QUrl, QObject, QEvent, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QRect, QSize, QThread, pyqtSignal, QTimer, QBuffer, QIODevice, QUrl, QObject, QEvent, QPropertyAnimation, QEasingCurve
 from PyQt6.QtGui import QIcon, QAction, QActionGroup, QFont, QDesktopServices, QTextCursor, QColor, QScreen, QGuiApplication
 import io
 import re
@@ -397,17 +399,264 @@ class _DeviceIDThread(QThread):
             self.device_id_ready.emit("")
 
 
+class _ApiProviderProbeThread(QThread):
+    probe_finished = pyqtSignal(bool, str)  # ok, message
+
+    def __init__(self, *, base_url: str, api_key: str, timeout_sec: float = 3.0):
+        super().__init__()
+        self.base_url = str(base_url or "").strip()
+        self.api_key = str(api_key or "").strip()
+        try:
+            self.timeout_sec = float(timeout_sec)
+        except Exception:
+            self.timeout_sec = 3.0
+
+    def run(self):
+        base_url = self.base_url
+        if not base_url:
+            self.probe_finished.emit(False, "未填写BaseURL")
+            return
+        if not (base_url.startswith("http://") or base_url.startswith("https://")):
+            base_url = "https://" + base_url
+
+        try:
+            import requests
+            headers = {}
+            if self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+            try:
+                candidates = []
+                if "/v1/" in base_url:
+                    root = base_url.split("/v1/")[0].rstrip("/") + "/v1"
+                    candidates.append(root.rstrip("/") + "/models")
+                elif base_url.rstrip("/").endswith("/v1"):
+                    candidates.append(base_url.rstrip("/") + "/models")
+                else:
+                    candidates.append(base_url.rstrip("/") + "/v1/models")
+                candidates.append(base_url)
+
+                last_code = 0
+                for url in candidates:
+                    resp = requests.get(url, headers=headers, timeout=self.timeout_sec, allow_redirects=True)
+                    code = int(getattr(resp, "status_code", 0) or 0)
+                    last_code = code
+                    if code in (200, 204):
+                        self.probe_finished.emit(True, f"可用（HTTP {code}）")
+                        return
+                    if code in (401, 403):
+                        self.probe_finished.emit(True, f"可用（鉴权失败，检查APIKey，HTTP {code}）")
+                        return
+                    if code == 404:
+                        continue
+                    if code >= 500:
+                        self.probe_finished.emit(False, f"服务端错误（HTTP {code}）")
+                        return
+                    if code > 0:
+                        self.probe_finished.emit(True, f"可访问（HTTP {code}）")
+                        return
+                self.probe_finished.emit(False, f"不可用（HTTP {last_code or 0}）")
+            except requests.exceptions.Timeout:
+                self.probe_finished.emit(False, "请求超时")
+            except requests.exceptions.ConnectionError:
+                self.probe_finished.emit(False, "网络连接失败")
+            except Exception:
+                self.probe_finished.emit(False, "请求异常")
+        except Exception:
+            self.probe_finished.emit(False, "缺少 requests 依赖")
+
+
+class _ApiTranslationResult:
+    def __init__(self, *, translated_text: str, error: str = "", original_text: str = ""):
+        self.translated_text = translated_text
+        self.error = error
+        self.original_text = original_text
+
+
+class _ApiTranslator:
+    def __init__(self, *, base_url: str, api_key: str, model: str = "", timeout_sec: float = 30.0):
+        self.base_url = str(base_url or "").strip()
+        self.api_key = str(api_key or "").strip()
+        self.model = str(model or "").strip()
+        try:
+            self.timeout_sec = float(timeout_sec)
+        except Exception:
+            self.timeout_sec = 30.0
+
+    def _normalize_endpoint(self) -> str:
+        base = str(self.base_url or "").strip()
+        if not base:
+            return ""
+        if not (base.startswith("http://") or base.startswith("https://")):
+            base = "https://" + base
+        if "/api/chat" in base or base.rstrip("/").endswith("/api/chat"):
+            return base
+        if "/api/generate" in base or base.rstrip("/").endswith("/api/generate"):
+            return base
+        if "/chat/completions" in base or "/completions" in base or base.rstrip("/").endswith("/translate"):
+            return base
+        if "/v1/" in base:
+            root = base.split("/v1/")[0].rstrip("/") + "/v1"
+            return root.rstrip("/") + "/chat/completions"
+        if base.rstrip("/").endswith("/v1"):
+            return base.rstrip("/") + "/chat/completions"
+        return base.rstrip("/") + "/v1/chat/completions"
+
+    def translate(self, text: str, *, target_lang: str, source_lang: str, preprocess: bool = True):
+        endpoint = self._normalize_endpoint()
+        if not endpoint:
+            raise RuntimeError("未填写BaseURL")
+        if not self.model:
+            raise RuntimeError("请先添加并选择模型")
+
+        src_name = str(source_lang or "")
+        tgt_name = str(target_lang or "")
+        try:
+            src_name = display_name_for_key(source_lang) or src_name
+        except Exception:
+            pass
+        try:
+            tgt_name = display_name_for_key(target_lang) or tgt_name
+        except Exception:
+            pass
+
+        try:
+            import requests
+        except Exception:
+            raise RuntimeError("缺少 requests 依赖")
+
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["X-API-Key"] = self.api_key
+
+        prompt = (
+            f"Translate the following text from {src_name} to {tgt_name}. "
+            "Return only the translated text. Preserve line breaks and formatting.\n\n"
+            f"{text}"
+        )
+        if "/api/generate" in endpoint or endpoint.rstrip("/").endswith("/api/generate"):
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+                "temperature": 0.2,
+            }
+        else:
+            payload = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "You are a translation engine."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.2,
+                "stream": False,
+            }
+
+        try:
+            resp = requests.post(endpoint, headers=headers, json=payload, timeout=self.timeout_sec)
+        except requests.exceptions.Timeout:
+            raise RuntimeError("请求超时")
+        except requests.exceptions.ConnectionError:
+            raise RuntimeError("网络连接失败")
+        except Exception:
+            raise RuntimeError("请求异常")
+
+        text_body = (getattr(resp, "text", "") or "").strip()
+        try:
+            data = resp.json()
+        except Exception:
+            data = None
+
+
+        if isinstance(data, dict):
+            msg = data.get("message")
+            if isinstance(msg, dict) and msg.get("content") is not None:
+                return _ApiTranslationResult(translated_text=str(msg.get("content") or ""), original_text=str(text or ""))
+            if data.get("response") is not None:
+                return _ApiTranslationResult(translated_text=str(data.get("response") or ""), original_text=str(text or ""))
+            choices = data.get("choices")
+            if isinstance(choices, list) and choices:
+                c0 = choices[0] if isinstance(choices[0], dict) else {}
+                msg = c0.get("message") if isinstance(c0, dict) else None
+                if isinstance(msg, dict) and msg.get("content") is not None:
+                    return _ApiTranslationResult(translated_text=str(msg.get("content") or ""), original_text=str(text or ""))
+                if isinstance(c0, dict) and c0.get("text") is not None:
+                    return _ApiTranslationResult(translated_text=str(c0.get("text") or ""), original_text=str(text or ""))
+
+            for k in ("translated_text", "translation", "result", "data"):
+                if k in data and data.get(k) is not None:
+                    v = data.get(k)
+                    if isinstance(v, dict):
+                        for kk in ("translated_text", "translation", "text"):
+                            if kk in v and v.get(kk) is not None:
+                                return _ApiTranslationResult(translated_text=str(v.get(kk) or ""), original_text=str(text or ""))
+                    if isinstance(v, str):
+                        return _ApiTranslationResult(translated_text=str(v or ""), original_text=str(text or ""))
+
+        if 200 <= int(getattr(resp, "status_code", 0) or 0) < 300 and text_body:
+            return _ApiTranslationResult(translated_text=text_body, original_text=str(text or ""))
+
+        code = int(getattr(resp, "status_code", 0) or 0)
+        if code in (401, 403):
+            raise RuntimeError(f"鉴权失败（HTTP {code}）")
+        if code == 404:
+            raise RuntimeError("接口不存在（HTTP 404），BaseURL可能不是OpenAI兼容地址")
+        if code:
+            raise RuntimeError(f"HTTP {code}: {(text_body[:200] if text_body else '')}".strip())
+        raise RuntimeError("翻译失败")
+
+
+class _TranslatorInitThread(QThread):
+    progress = pyqtSignal(str)
+    init_finished = pyqtSignal(bool, object, dict)  # success, translator, stats
+
+    def __init__(self, *, model_path: str | None = None):
+        super().__init__()
+        self.model_path = model_path
+
+    def run(self):
+        try:
+            self.progress.emit("正在加载本地翻译模型...")
+            from src.core.local_translator import LocalAITranslator
+            from src.utils.resource_monitor import get_process_stats, get_gpu_stats
+
+            ps_before = get_process_stats()
+            gs_before = get_gpu_stats()
+            translator = LocalAITranslator(self.model_path)
+            ps_after = get_process_stats()
+            gs_after = get_gpu_stats()
+
+            stats = {
+                "rss_delta_bytes": max(0, int(ps_after.rss_bytes) - int(ps_before.rss_bytes)),
+                "gpu_allocated_delta_bytes": (
+                    None
+                    if (not gs_after.available or gs_before.allocated_bytes is None or gs_after.allocated_bytes is None)
+                    else max(0, int(gs_after.allocated_bytes) - int(gs_before.allocated_bytes))
+                ),
+                "gpu_reserved_delta_bytes": (
+                    None
+                    if (not gs_after.available or gs_before.reserved_bytes is None or gs_after.reserved_bytes is None)
+                    else max(0, int(gs_after.reserved_bytes) - int(gs_before.reserved_bytes))
+                ),
+                "device": getattr(translator, "device", None),
+            }
+            self.init_finished.emit(True, translator, stats)
+        except Exception as e:
+            self.init_finished.emit(False, None, {"error": str(e)})
+
+
 class _ComponentInitThread(QThread):
     """异步组件初始化线程"""
     progress = pyqtSignal(str)  # message
     component_ready = pyqtSignal(str, object, dict)  # name, component, stats
     init_finished = pyqtSignal(bool, dict, dict)  # success, components, stats
 
-    def __init__(self, *, config_manager, tesseract_manager=None, model_path: str | None = None):
+    def __init__(self, *, config_manager, tesseract_manager=None, model_path: str | None = None, skip_translator: bool = False):
         super().__init__()
         self.config_manager = config_manager
         self.tesseract_manager = tesseract_manager
         self.model_path = model_path
+        self.skip_translator = bool(skip_translator)
 
     def run(self):
         try:
@@ -451,32 +700,36 @@ class _ComponentInitThread(QThread):
             self.component_ready.emit("ocr", ocr, stats["ocr"])
 
             # 模型初始化（最重）
-            self.progress.emit("正在加载本地翻译模型...")
-            from src.core.local_translator import LocalAITranslator
-            from src.utils.resource_monitor import get_process_stats, get_gpu_stats
+            if self.skip_translator:
+                self.progress.emit("API模式已启用：跳过本地模型加载")
+                stats["translator"] = {"skipped": True}
+            else:
+                self.progress.emit("正在加载本地翻译模型...")
+                from src.core.local_translator import LocalAITranslator
+                from src.utils.resource_monitor import get_process_stats, get_gpu_stats
 
-            ps_before = get_process_stats()
-            gs_before = get_gpu_stats()
-            translator = LocalAITranslator(self.model_path)
-            ps_after = get_process_stats()
-            gs_after = get_gpu_stats()
+                ps_before = get_process_stats()
+                gs_before = get_gpu_stats()
+                translator = LocalAITranslator(self.model_path)
+                ps_after = get_process_stats()
+                gs_after = get_gpu_stats()
 
-            stats["translator"] = {
-                "rss_delta_bytes": max(0, int(ps_after.rss_bytes) - int(ps_before.rss_bytes)),
-                "gpu_allocated_delta_bytes": (
-                    None
-                    if (not gs_after.available or gs_before.allocated_bytes is None or gs_after.allocated_bytes is None)
-                    else max(0, int(gs_after.allocated_bytes) - int(gs_before.allocated_bytes))
-                ),
-                "gpu_reserved_delta_bytes": (
-                    None
-                    if (not gs_after.available or gs_before.reserved_bytes is None or gs_after.reserved_bytes is None)
-                    else max(0, int(gs_after.reserved_bytes) - int(gs_before.reserved_bytes))
-                ),
-                "device": getattr(translator, "device", None),
-            }
-            components["translator"] = translator
-            self.component_ready.emit("translator", translator, stats["translator"])
+                stats["translator"] = {
+                    "rss_delta_bytes": max(0, int(ps_after.rss_bytes) - int(ps_before.rss_bytes)),
+                    "gpu_allocated_delta_bytes": (
+                        None
+                        if (not gs_after.available or gs_before.allocated_bytes is None or gs_after.allocated_bytes is None)
+                        else max(0, int(gs_after.allocated_bytes) - int(gs_before.allocated_bytes))
+                    ),
+                    "gpu_reserved_delta_bytes": (
+                        None
+                        if (not gs_after.available or gs_before.reserved_bytes is None or gs_after.reserved_bytes is None)
+                        else max(0, int(gs_after.reserved_bytes) - int(gs_before.reserved_bytes))
+                    ),
+                    "device": getattr(translator, "device", None),
+                }
+                components["translator"] = translator
+                self.component_ready.emit("translator", translator, stats["translator"])
 
             self.init_finished.emit(True, components, stats)
         except Exception as e:
@@ -534,7 +787,7 @@ class MainWindow(QMainWindow):
             'hook_port': self.config_manager.get_int('hook', 'port', 37123),
             'hook_target_process': self.config_manager.get('hook', 'target_process', ''),
             'hook_auto_start': self.config_manager.get_bool('hook', 'auto_start', False),
-            'hook_prefer_frida_only': self.config_manager.get_bool('hook', 'prefer_frida_only', True),
+            'hook_prefer_frida_only': self.config_manager.get_bool('hook', 'prefer_frida_only', False),
         }
 
         # 启动时规范化翻译语言配置（兼容旧值：ZH/EN/中文等），并确保目标语言默认中文（简体）
@@ -567,6 +820,57 @@ class MainWindow(QMainWindow):
             self.config["quick_languages"] = normalized_quick
         except Exception:
             pass
+
+        self._api_enabled = self.config_manager.get_bool("api", "enabled", False)
+        self._api_base_url = self.config_manager.get("api", "base_url", "")
+        self._api_key = self.config_manager.get("api", "api_key", "")
+        self._api_model = str(self.config_manager.get("api", "model", "") or "").strip()
+        self._api_probe_thread = None
+        self._api_provider_probe_ok = None
+        self._api_provider_probe_message = ""
+        self._api_translator = None
+        self._api_models: list[str] = []
+        try:
+            import json
+            raw_models = str(self.config_manager.get("api", "models", "[]") or "[]")
+            parsed = json.loads(raw_models) if raw_models else []
+            if isinstance(parsed, list):
+                self._api_models = [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            try:
+                raw_models = str(self.config_manager.get("api", "models", "") or "")
+                self._api_models = [x.strip() for x in raw_models.split("\n") if x.strip()]
+            except Exception:
+                self._api_models = []
+
+        if self._api_model and self._api_model not in self._api_models:
+            self._api_models.append(self._api_model)
+            try:
+                import json
+                self.config_manager.set("api", "models", json.dumps(self._api_models, ensure_ascii=False))
+            except Exception:
+                pass
+
+        if (not self._api_model) and len(self._api_models) == 1:
+            self._api_model = self._api_models[0]
+            try:
+                self.config_manager.set("api", "model", self._api_model)
+            except Exception:
+                pass
+
+        if self._api_enabled:
+            try:
+                if self.translator is not None and hasattr(self.translator, "unload_model"):
+                    self.translator.unload_model()
+            except Exception:
+                pass
+            self.translator = None
+            try:
+                if str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
+                    self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
+                    self.translator = self._api_translator
+            except Exception:
+                self._api_translator = None
         
         self.screenshot_tool = None
         self.overlay = None
@@ -609,10 +913,26 @@ class MainWindow(QMainWindow):
         self._hook_running = False
         self._hook_scan_thread = None
         self._last_hook_text = ""
+        self._last_hook_text_ts = 0.0
         self._hook_any_text_received = False
+        self._hook_prefer_frida_only_active = False
+        self._hook_compat_fallback_applied = False
         self._hook_log_current_path = ""
         self._hook_arch_switch_prompted = False
         self._hook_agent_process = None
+        self._hook_candidate_stats = {}
+        self._hook_recent_packets = deque(maxlen=256)
+        self._hook_preferred_signature = ""
+        self._hook_auto_signature = ""
+        self._hook_auto_signature_value = float("-inf")
+        self._hook_selected_signature_logged = ""
+        self._hook_start_ts = 0.0
+        self._hook_startup_ignore_until = 0.0
+        self._hook_startup_suppressed_logged = False
+        self._hook_startup_buffer_packet = None
+        self._hook_live_dialogue_ts = 0.0
+        self._hook_live_dialogue_label = ""
+        self._hook_live_dialogue_text = ""
         
         # 初始化UI
         self.init_ui()
@@ -1172,6 +1492,11 @@ class MainWindow(QMainWindow):
         status_layout.addWidget(self.tesseract_status_label)
         self.ocr_status_label = QLabel("OCR: 初始化中…")
         status_layout.addWidget(self.ocr_status_label)
+
+        self.api_provider_status_label = QLabel("API服务商: -")
+        self.api_provider_status_label.setVisible(bool(self._api_enabled))
+        status_layout.addWidget(self.api_provider_status_label)
+
         self.model_status_label = QLabel("模型: 初始化中…")
         status_layout.addWidget(self.model_status_label)
 
@@ -1185,6 +1510,71 @@ class MainWindow(QMainWindow):
 
         status_group.setLayout(status_layout)
         self._view_status_layout.addWidget(status_group)
+
+        api_card = QGroupBox("API服务")
+        api_card_layout = QVBoxLayout()
+
+        api_base_url_layout = QHBoxLayout()
+        api_base_url_layout.addWidget(QLabel("BaseURL:"))
+        self.api_base_url_edit = QLineEdit()
+        self.api_base_url_edit.setPlaceholderText("例如: https://api.example.com")
+        self.api_base_url_edit.setText(str(self._api_base_url or ""))
+        self.api_base_url_edit.editingFinished.connect(self._save_api_base_url_setting)
+        api_base_url_layout.addWidget(self.api_base_url_edit)
+        api_card_layout.addLayout(api_base_url_layout)
+
+        api_key_layout = QHBoxLayout()
+        api_key_layout.addWidget(QLabel("APIKey:"))
+        self.api_key_edit = QLineEdit()
+        try:
+            self.api_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        except Exception:
+            pass
+        self.api_key_edit.setPlaceholderText("填入后默认保存（仅本地保存）")
+        self.api_key_edit.setText(str(self._api_key or ""))
+        self.api_key_edit.editingFinished.connect(self._save_api_key_setting)
+        api_key_layout.addWidget(self.api_key_edit)
+        api_card_layout.addLayout(api_key_layout)
+
+        api_model_header = QHBoxLayout()
+        api_model_header.addWidget(QLabel("模型:"))
+        api_card_layout.addLayout(api_model_header)
+
+        self.api_model_list = QListWidget()
+        try:
+            self.api_model_list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        except Exception:
+            pass
+        self.api_model_list.currentItemChanged.connect(self._on_api_model_selected)
+        api_card_layout.addWidget(self.api_model_list)
+
+        api_model_add_row = QHBoxLayout()
+        api_model_add_row.addStretch()
+        self.api_model_add_button = QToolButton()
+        self.api_model_add_button.setText("+")
+        try:
+            self.api_model_add_button.setFixedSize(self._scale_size(26), self._scale_size(26))
+        except Exception:
+            pass
+        self.api_model_add_button.clicked.connect(self._add_api_model_dialog)
+        api_model_add_row.addWidget(self.api_model_add_button, 0, Qt.AlignmentFlag.AlignRight)
+        api_card_layout.addLayout(api_model_add_row)
+
+        self.api_enable_button = QPushButton()
+        try:
+            self.api_enable_button.setCheckable(True)
+        except Exception:
+            pass
+        try:
+            self.api_enable_button.setChecked(bool(self._api_enabled))
+        except Exception:
+            pass
+        self.api_enable_button.clicked.connect(self._toggle_api_service_enabled)
+        api_card_layout.addWidget(self.api_enable_button)
+
+        api_card.setLayout(api_card_layout)
+        self._view_status_layout.addWidget(api_card)
+        self._api_card = api_card
         
         # 3. 控制区域
         control_group = QGroupBox("翻译控制")
@@ -1546,6 +1936,11 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        try:
+            self._apply_api_service_ui_state()
+        except Exception:
+            pass
+
         # 初始化启动/停止按钮文本
         self.update_translate_button_label()
         try:
@@ -1900,6 +2295,22 @@ class MainWindow(QMainWindow):
                 border: 0px;
                 width: 28px;
             }
+            #mainRoot QSpinBox::up-button,
+            #mainRoot QSpinBox::down-button,
+            #mainRoot QDoubleSpinBox::up-button,
+            #mainRoot QDoubleSpinBox::down-button {
+                width: 0px;
+                height: 0px;
+                border: none;
+            }
+            #mainRoot QSpinBox::up-arrow,
+            #mainRoot QSpinBox::down-arrow,
+            #mainRoot QDoubleSpinBox::up-arrow,
+            #mainRoot QDoubleSpinBox::down-arrow {
+                image: none;
+                width: 0px;
+                height: 0px;
+            }
 
             #mainRoot QScrollBar:vertical {
                 background: transparent;
@@ -2064,6 +2475,7 @@ class MainWindow(QMainWindow):
             config_manager=self.config_manager,
             tesseract_manager=self.tesseract_manager,
             model_path=model_path,
+            skip_translator=bool(self._api_enabled),
         )
         self._async_init_thread = th
         th.progress.connect(self._on_init_progress)
@@ -2075,6 +2487,13 @@ class MainWindow(QMainWindow):
         self._refresh_system_status()
 
     def _components_ready_for_work(self) -> bool:
+        if bool(getattr(self, "_api_enabled", False)):
+            return (
+                bool(self.ocr_processor)
+                and bool(self.translator)
+                and bool(str(getattr(self, "_api_base_url", "") or "").strip())
+                and bool(str(getattr(self, "_api_model", "") or "").strip())
+            )
         return bool(self.ocr_processor) and bool(self.translator)
 
     def _on_init_progress(self, msg: str) -> None:
@@ -2097,6 +2516,20 @@ class MainWindow(QMainWindow):
         elif name == "ocr":
             self.ocr_processor = component  # type: ignore[assignment]
         elif name == "translator":
+            if bool(getattr(self, "_api_enabled", False)):
+                try:
+                    if component is not None and hasattr(component, "unload_model"):
+                        component.unload_model()
+                except Exception:
+                    pass
+                try:
+                    self._gpu_stats_enabled = False
+                except Exception:
+                    pass
+                self._apply_api_service_ui_state()
+                self._refresh_system_status()
+                return
+
             self.translator = component  # type: ignore[assignment]
             # 仅在 CUDA 模式下启用 GPU 监控（否则避免 import torch）
             try:
@@ -2129,7 +2562,15 @@ class MainWindow(QMainWindow):
         if success and isinstance(components, dict):
             self.tesseract_manager = components.get("tesseract_manager", self.tesseract_manager)
             self.ocr_processor = components.get("ocr_processor", self.ocr_processor)
-            self.translator = components.get("translator", self.translator)
+            if not bool(getattr(self, "_api_enabled", False)):
+                self.translator = components.get("translator", self.translator)
+            else:
+                try:
+                    t = components.get("translator", None)
+                    if t is not None and hasattr(t, "unload_model"):
+                        t.unload_model()
+                except Exception:
+                    pass
 
         if isinstance(stats, dict):
             # stats 结构可能包含 error
@@ -2142,7 +2583,7 @@ class MainWindow(QMainWindow):
             self._init_progress_text = "初始化完成" if success else "初始化失败"
 
         # 组件就绪后启用按钮
-        if self._components_ready_for_work():
+        if (not bool(getattr(self, "_api_enabled", False))) and self._components_ready_for_work():
             self.translate_button.setEnabled(True)
             try:
                 self.test_button.setEnabled(True)
@@ -2151,7 +2592,7 @@ class MainWindow(QMainWindow):
             self._init_progress_text = "初始化完成"
 
         # 文本模式只要求翻译器就绪
-        if self.translator:
+        if (not bool(getattr(self, "_api_enabled", False))) and self.translator:
             # 仅在 CUDA 模式下启用 GPU 监控（否则避免 import torch）
             try:
                 dev = str(getattr(self.translator, "device", "") or "").lower()
@@ -2163,9 +2604,18 @@ class MainWindow(QMainWindow):
                     self.text_mode_button.setEnabled(True)
             except Exception:
                 pass
+        else:
+            try:
+                self._gpu_stats_enabled = False
+            except Exception:
+                pass
 
         try:
             self.update_translate_button_label()
+        except Exception:
+            pass
+        try:
+            self._apply_api_service_ui_state()
         except Exception:
             pass
         self._refresh_system_status()
@@ -2231,13 +2681,22 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        # API 服务商状态（仅启用时显示）
+        try:
+            if bool(getattr(self, "_api_enabled", False)):
+                msg = str(getattr(self, "_api_provider_probe_message", "") or "").strip() or "-"
+                self.api_provider_status_label.setText(f"API服务商: {msg}")
+        except Exception:
+            pass
+
         # 模型状态
         try:
-            if self.translator:
-                device = getattr(self.translator, "device", None) or "-"
-                self.model_status_label.setText(f"模型: 就绪（{device}）")
-            else:
-                self.model_status_label.setText(f"模型: {self._init_progress_text or '初始化中…'}")
+            if not bool(getattr(self, "_api_enabled", False)):
+                if self.translator:
+                    device = getattr(self.translator, "device", None) or "-"
+                    self.model_status_label.setText(f"模型: 就绪（{device}）")
+                else:
+                    self.model_status_label.setText(f"模型: {self._init_progress_text or '初始化中…'}")
         except Exception:
             pass
 
@@ -2260,23 +2719,39 @@ class MainWindow(QMainWindow):
             pass
 
         try:
-            tstats = self._component_stats.get("translator", {}) or {}
-            rss_d = tstats.get("rss_delta_bytes")
-            rss_s = (rm.format_bytes(rss_d) if (rm is not None and rss_d) else "-")
-            if gs is None or not getattr(gs, "available", False):
-                self.model_resource_label.setText(f"模型资源: 内存Δ {rss_s} | CPU {cpu_now}")
-            else:
-                ga = tstats.get("gpu_allocated_delta_bytes")
-                gr = tstats.get("gpu_reserved_delta_bytes")
-                ga_s = (rm.format_bytes(ga) if (rm is not None and ga) else "-")
-                gr_s = (rm.format_bytes(gr) if (rm is not None and gr) else "-")
-                self.model_resource_label.setText(f"模型资源: 内存Δ {rss_s} | 显存Δ {ga_s} 已分配 / {gr_s} 已保留")
+            if not bool(getattr(self, "_api_enabled", False)):
+                tstats = self._component_stats.get("translator", {}) or {}
+                rss_d = tstats.get("rss_delta_bytes")
+                rss_s = (rm.format_bytes(rss_d) if (rm is not None and rss_d) else "-")
+                if gs is None or not getattr(gs, "available", False):
+                    self.model_resource_label.setText(f"模型资源: 内存Δ {rss_s} | CPU {cpu_now}")
+                else:
+                    ga = tstats.get("gpu_allocated_delta_bytes")
+                    gr = tstats.get("gpu_reserved_delta_bytes")
+                    ga_s = (rm.format_bytes(ga) if (rm is not None and ga) else "-")
+                    gr_s = (rm.format_bytes(gr) if (rm is not None and gr) else "-")
+                    self.model_resource_label.setText(f"模型资源: 内存Δ {rss_s} | 显存Δ {ga_s} 已分配 / {gr_s} 已保留")
         except Exception:
             pass
 
     def update_translate_button_label(self):
         """根据当前状态和快捷键更新启动/停止按钮文本"""
         hotkey = self.config.get('hotkey', 'b')
+        if bool(getattr(self, "_api_enabled", False)):
+            if not bool(str(getattr(self, "_api_base_url", "") or "").strip()):
+                self.translate_button.setText(f"请先填写BaseURL (快捷键: {hotkey})")
+                try:
+                    self.translate_button.setEnabled(False)
+                except Exception:
+                    pass
+                return
+            if not bool(str(getattr(self, "_api_model", "") or "").strip()):
+                self.translate_button.setText(f"请先添加并选择模型 (快捷键: {hotkey})")
+                try:
+                    self.translate_button.setEnabled(False)
+                except Exception:
+                    pass
+                return
         if not self._components_ready_for_work():
             hint = self._init_progress_text or "初始化中"
             self.translate_button.setText(f"初始化中… ({hint}) (快捷键: {hotkey})")
@@ -2796,7 +3271,11 @@ class MainWindow(QMainWindow):
 
         self._start_hook_service()
 
-    def _start_hook_service(self) -> None:
+    def _start_hook_service(self, force_compat: bool = False) -> None:
+        try:
+            self._terminate_orphan_hook_agents()
+        except Exception:
+            pass
         try:
             if self.is_translating:
                 self.toggle_translation()
@@ -2870,12 +3349,31 @@ class MainWindow(QMainWindow):
             self._hook_session_id = 1
         session_id = int(self._hook_session_id)
         try:
+            now_ts = float(time.time())
             self._hook_any_text_received = False
+            self._hook_prefer_frida_only_active = False
+            self._hook_compat_fallback_applied = bool(force_compat)
+            self._hook_arch_switch_prompted = False
             self._hook_log_current_path = ""
             self._last_hook_text = ""
+            self._last_hook_text_ts = 0.0
             self._hook_learned = False
             self._hook_pending_prefix = ""
             self._hook_pending_prefix_ts = 0.0
+            self._hook_pending_prefix_signature = ""
+            self._hook_candidate_stats = {}
+            self._hook_recent_packets = deque(maxlen=256)
+            self._hook_preferred_signature = ""
+            self._hook_auto_signature = ""
+            self._hook_auto_signature_value = float("-inf")
+            self._hook_selected_signature_logged = ""
+            self._hook_start_ts = now_ts
+            self._hook_startup_ignore_until = 0.0
+            self._hook_startup_suppressed_logged = False
+            self._hook_startup_buffer_packet = None
+            self._hook_live_dialogue_ts = 0.0
+            self._hook_live_dialogue_label = ""
+            self._hook_live_dialogue_text = ""
         except Exception:
             pass
         try:
@@ -2899,7 +3397,9 @@ class MainWindow(QMainWindow):
             hook_port = int(self.config.get("hook_port", 37123))
         except Exception:
             hook_port = 37123
-        prefer_frida_only = bool(self.config.get("hook_prefer_frida_only", True))
+        prefer_frida_only_cfg = bool(self.config.get("hook_prefer_frida_only", False))
+        prefer_frida_only = bool(prefer_frida_only_cfg and (not bool(force_compat)))
+        self._hook_prefer_frida_only_active = prefer_frida_only
         th = HookTextThread(
             pid=int(target_pid),
             listen_port=hook_port,
@@ -2910,14 +3410,50 @@ class MainWindow(QMainWindow):
         )
         setattr(th, "_hook_session_id", session_id)
         self._hook_scan_thread = th
-        th.text_received.connect(lambda t: self._on_hook_text_received(session_id, t))
+        if hasattr(th, "packet_received"):
+            th.packet_received.connect(lambda packet: self._on_hook_packet_received(session_id, packet))
+        else:
+            th.text_received.connect(lambda t: self._on_hook_text_received(session_id, t))
         th.status.connect(lambda s: self._on_hook_status(session_id, s))
         th.start()
         self._hook_running = True
+        if prefer_frida_only:
+            QTimer.singleShot(8000, lambda sid=session_id: self._hook_maybe_enable_compat_mode(sid))
         try:
             self._update_hook_button_label()
         except Exception:
             pass
+
+    def _hook_maybe_enable_compat_mode(self, session_id: int) -> None:
+        try:
+            if int(session_id) != int(getattr(self, "_hook_session_id", 0)):
+                return
+        except Exception:
+            return
+        try:
+            if not bool(getattr(self, "_hook_running", False)):
+                return
+            th = getattr(self, "_hook_scan_thread", None)
+            if th is None or not bool(th.isRunning()):
+                return
+        except Exception:
+            return
+        try:
+            if bool(getattr(self, "_hook_any_text_received", False)):
+                return
+            if not bool(getattr(self, "_hook_prefer_frida_only_active", False)):
+                return
+            if bool(getattr(self, "_hook_compat_fallback_applied", False)):
+                return
+        except Exception:
+            return
+
+        self.log_message("Hook兼容回退: Frida-only 8秒未收到文本，自动启用 UIA/WinEvent 辅助通道")
+        try:
+            self._stop_hook_service()
+        except Exception:
+            pass
+        self._start_hook_service(force_compat=True)
 
     def _on_hook_status(self, session_id: int, status: str) -> None:
         try:
@@ -2928,13 +3464,31 @@ class MainWindow(QMainWindow):
         s = str(status or "")
         if s:
             try:
-                if "Hook架构不匹配" in s or "Hook需要切换:" in s:
+                # Only switch architecture on explicit mismatch evidence.
+                # Bare "Hook需要切换" hints can arrive late from helper and cause relaunch loops.
+                if (
+                    ("Hook架构不匹配" in s)
+                    or ("Hook架构检测" in s and ("目标进程 x86" in s or "目标进程 x64" in s) and ("Python x86" in s or "Python x64" in s))
+                ):
                     self._maybe_launch_other_arch(s)
             except Exception:
                 pass
         if s:
             try:
-                if "已学习读取规则" in s or "Hook钩子已就绪" in s or "Hook外部端口监听" in s or "Hook Frida 已启动" in s or "Hook UIA 轮询已启动" in s:
+                ready_markers = (
+                    "已学习读取规则",
+                    "Hook钩子已就绪",
+                    "Hook外部端口监听",
+                    "Hook Frida 线程已启动",
+                    "Hook Frida 脚本已加载",
+                    "Hook Frida 已启动",
+                    "Hook UIA 轮询已启动",
+                    "Hook SDL_ttf 已启动",
+                    "Hook Python API 已启动",
+                    "Hook Ren'Py 注入已完成",
+                    "Hook 准备就绪",
+                )
+                if any(m in s for m in ready_markers):
                     self._hook_learned = True
                 elif "规则失效" in s or "学习读取规则失败" in s:
                     self._hook_learned = False
@@ -2948,7 +3502,544 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _hook_normalize_packet(self, packet) -> dict | None:
+        raw = packet if isinstance(packet, dict) else {"text": packet}
+        try:
+            text = str(raw.get("text") or "")
+        except Exception:
+            text = ""
+        text = text.replace("\x00", "")
+        text = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f]", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        if not text:
+            return None
+        try:
+            source = str(raw.get("source") or raw.get("transport") or "unknown").strip().lower() or "unknown"
+        except Exception:
+            source = "unknown"
+        try:
+            label = str(raw.get("label") or source or "unknown").strip() or source
+        except Exception:
+            label = source or "unknown"
+        try:
+            thread_id = int(raw.get("thread_id", raw.get("threadId")))
+        except Exception:
+            thread_id = None
+        try:
+            pid = int(raw.get("pid")) if raw.get("pid") not in (None, "") else None
+        except Exception:
+            pid = None
+        signature = str(raw.get("signature") or f"{source}|{label}|{thread_id if thread_id is not None else 0}")
+        transport = str(raw.get("transport") or "").strip().lower()
+        return {
+            "text": text,
+            "source": source,
+            "label": label,
+            "thread_id": thread_id,
+            "pid": pid,
+            "transport": transport,
+            "signature": signature,
+        }
+
+    def _hook_evaluate_packet(self, packet: dict) -> dict:
+        text = str(packet.get("text") or "").strip()
+        tl = text.lower()
+        source = str(packet.get("source") or "").strip().lower()
+        label = str(packet.get("label") or "").strip().lower()
+        label_profile = self._hook_label_profile(label)
+        trusted_socket_live = (
+            source == "socket"
+            and (
+                label.startswith("renpy:patch:")
+                or label.startswith("renpy:interact:")
+                or label.startswith("renpy:poll:")
+            )
+        )
+        dialogue_like = self._hook_text_is_dialogue_like(text)
+        code_like = self._hook_text_is_code_like(text)
+
+        score = 0.0
+        hard_reject = False
+        reasons: list[str] = []
+
+        if source == "frida":
+            score += 1.5
+        elif source == "socket":
+            score += 0.5
+        elif source == "uia":
+            score -= 3.0
+            reasons.append("uia")
+        elif source == "win_event":
+            score -= 3.5
+            reasons.append("win_event")
+
+        score += float(label_profile.get("score") or 0.0)
+        if bool(label_profile.get("glyph")):
+            reasons.append("glyph")
+        if bool(label_profile.get("engine_noise")):
+            reasons.append("engine_hook")
+        if bool(label_profile.get("pystring")):
+            reasons.append("pystring")
+        pystring_dialogue_ok = False
+
+        fatal_substrings = (
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".ogg",
+            ".mp3",
+            ".wav",
+            ".dll",
+            ".exe",
+            ".rpy",
+            ".rpa",
+            ".save",
+            "traceback",
+            "syntaxerror",
+            "must be unicode",
+            "expected a character buffer object",
+            "string index out of range",
+            "bytearray index out of range",
+            "unexpected character after line continuation character",
+            "primary display bounds",
+            "window was restored",
+            "windowed mode",
+            "screen sizes:",
+            "persistent.",
+            "main_menu",
+            "menu_art_",
+            "menu_bg",
+            "viewport",
+            "style_prefix",
+            "button_text",
+            "say_window",
+            "keymap",
+            "xalign",
+            "yalign",
+            "child_size",
+            "py_repr",
+            "file \"",
+        )
+        if any(bad in tl for bad in fatal_substrings):
+            score -= 8.0
+            if not trusted_socket_live:
+                hard_reject = True
+
+        if code_like:
+            score -= 8.0
+            if not trusted_socket_live:
+                hard_reject = True
+            reasons.append("code")
+        if re.fullmatch(r"[a-z][a-z0-9_]*", tl):
+            score -= 4.5
+            if "_" in tl and (not trusted_socket_live):
+                hard_reject = True
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*", text) and "_" in text:
+            score -= 5.0
+            if not trusted_socket_live:
+                hard_reject = True
+        if re.fullmatch(r"[A-Za-z]:", text):
+            score -= 8.0
+            if not trusted_socket_live:
+                hard_reject = True
+        if re.fullmatch(r"\d+\s*[-_/.:]\s*\d+", text):
+            score -= 8.0
+            if not trusted_socket_live:
+                hard_reject = True
+        if re.search(r"(?:^|[\s\"'])[\w./\\-]+\.(?:png|jpe?g|ogg|mp3|wav|dll|exe|rpy|rpa|save)\b", tl):
+            score -= 8.0
+            if not trusted_socket_live:
+                hard_reject = True
+
+        has_cjk_like = False
+        total = 0
+        bad = 0
+        for ch in text:
+            if ch.isspace():
+                continue
+            total += 1
+            cp = ord(ch)
+            is_cjk = 0x4E00 <= cp <= 0x9FFF
+            is_kana = 0x3040 <= cp <= 0x30FF
+            is_hangul = 0xAC00 <= cp <= 0xD7AF
+            if is_cjk or is_kana or is_hangul:
+                has_cjk_like = True
+            if (cp < 32 and not ch.isspace()) or ch in ("\ufffd", ""):
+                bad += 2
+                hard_reject = True
+            elif not (ch.isalnum() or is_cjk or is_kana or is_hangul or ch in " .,!?;:'\"-()[]{}<>/\\@#$%^&*_+=~|`“”‘’…，。！？、：；「」『』"):
+                bad += 1
+
+        if total <= 0:
+            hard_reject = True
+        else:
+            try:
+                bad_ratio = float(bad) / float(total)
+            except Exception:
+                bad_ratio = 0.0
+            if bad_ratio > 0.70:
+                score -= 8.0
+                hard_reject = True
+            elif bad_ratio > 0.45 and not has_cjk_like:
+                score -= 4.0
+
+        if has_cjk_like:
+            score += 2.5
+        if dialogue_like:
+            score += 2.0
+        pystring_dialogue_ok = bool(label_profile.get("pystring")) and (dialogue_like or has_cjk_like) and len(text) >= 6 and not code_like
+        if pystring_dialogue_ok and "pystring_dialogue" not in reasons:
+            reasons.append("pystring_dialogue")
+        if len(text) >= 6:
+            score += 1.0
+        if len(text) >= 12:
+            score += 1.0
+        if len(text) > 240:
+            score -= 2.5
+        if " " in text:
+            score += 1.5
+        if re.search(r"[.!?。！？…」』\"]$", text):
+            score += 1.5
+        if len(text) == 1 and text.isascii() and text.isalpha():
+            score -= 3.0
+        if bool(label_profile.get("pystring")) and not (dialogue_like or has_cjk_like):
+            score -= 5.0
+        elif pystring_dialogue_ok:
+            score += 2.5
+        if not dialogue_like and not has_cjk_like and len(text) < 5:
+            score -= 2.0
+
+        list_ok = (not hard_reject) and score > -2.5
+        translate_ok = (not hard_reject) and score > 2.5 and source not in ("uia", "win_event")
+        strong_candidate = (not hard_reject) and score >= 4.5 and (dialogue_like or has_cjk_like or bool(label_profile.get("trusted_lock")))
+        lock_ok = (
+            (not hard_reject)
+            and score >= 5.5
+            and source not in ("uia", "win_event")
+            and (not bool(label_profile.get("lock_block")))
+            and (dialogue_like or has_cjk_like or bool(label_profile.get("trusted_lock")))
+            and (not bool(label_profile.get("pystring")) or pystring_dialogue_ok)
+        )
+        return {
+            "score": score,
+            "hard_reject": hard_reject,
+            "list_ok": list_ok,
+            "translate_ok": translate_ok,
+            "strong_candidate": strong_candidate,
+            "lock_ok": lock_ok,
+            "trusted_lock": bool(label_profile.get("trusted_lock")),
+            "soft_lock": bool(label_profile.get("soft_lock") or label_profile.get("pystring_soft_lock")),
+            "dialogue_like": dialogue_like,
+            "has_cjk_like": has_cjk_like,
+            "pystring_dialogue_ok": pystring_dialogue_ok,
+            "reasons": reasons,
+        }
+
+    def _hook_format_packet_tooltip(self, packet: dict, eval_data: dict) -> str:
+        label = str(packet.get("label") or "unknown")
+        source = str(packet.get("source") or "unknown")
+        thread_id = packet.get("thread_id")
+        score = float(eval_data.get("score") or 0.0)
+        return f"来源: {source}\n标签: {label}\n线程: {thread_id if thread_id is not None else '-'}\n评分: {score:.1f}"
+
+    def _hook_log_signature_selection(self, signature: str, *, manual: bool) -> None:
+        sig = str(signature or "").strip()
+        if not sig or sig == str(getattr(self, "_hook_selected_signature_logged", "") or ""):
+            return
+        stats = self._hook_candidate_stats.get(sig, {})
+        label = str(stats.get("label") or "unknown")
+        thread_id = stats.get("thread_id")
+        mode = "手动锁定" if manual else "自动锁定"
+        self.log_message(f"Hook 已{mode}正文线程: {label} (TID {thread_id if thread_id is not None else '-'})")
+        self._hook_selected_signature_logged = sig
+
+    def _hook_update_candidate(self, packet: dict, eval_data: dict) -> None:
+        sig = str(packet.get("signature") or "")
+        if not sig:
+            return
+        stats = self._hook_candidate_stats.get(sig)
+        if not isinstance(stats, dict):
+            stats = {
+                "count": 0,
+                "score_sum": 0.0,
+                "best_score": float("-inf"),
+                "good_count": 0,
+                "list_count": 0,
+                "lock_count": 0,
+                "source": packet.get("source"),
+                "label": packet.get("label"),
+                "thread_id": packet.get("thread_id"),
+                "last_text": "",
+                "trusted_lock": False,
+                "soft_lock": False,
+                "value": float("-inf"),
+            }
+            self._hook_candidate_stats[sig] = stats
+
+        score = float(eval_data.get("score") or 0.0)
+        stats["count"] = int(stats.get("count") or 0) + 1
+        stats["score_sum"] = float(stats.get("score_sum") or 0.0) + score
+        stats["best_score"] = max(float(stats.get("best_score") or float("-inf")), score)
+        stats["good_count"] = int(stats.get("good_count") or 0) + (1 if bool(eval_data.get("translate_ok")) else 0)
+        stats["list_count"] = int(stats.get("list_count") or 0) + (1 if bool(eval_data.get("list_ok")) else 0)
+        stats["lock_count"] = int(stats.get("lock_count") or 0) + (1 if bool(eval_data.get("lock_ok")) else 0)
+        stats["source"] = packet.get("source")
+        stats["label"] = packet.get("label")
+        stats["thread_id"] = packet.get("thread_id")
+        stats["last_text"] = packet.get("text")
+        stats["trusted_lock"] = bool(eval_data.get("trusted_lock"))
+        stats["soft_lock"] = bool(eval_data.get("soft_lock") or stats.get("trusted_lock"))
+
+        avg = float(stats["score_sum"]) / max(int(stats["count"]), 1)
+        value = float(stats["best_score"]) + avg + min(int(stats["good_count"]), 4) * 1.4 + min(int(stats["list_count"]), 6) * 0.25
+        value += min(int(stats["lock_count"]), 4) * 0.9
+        if str(packet.get("source") or "") in ("uia", "win_event"):
+            value -= 3.0
+        if bool(stats.get("trusted_lock")):
+            value += 2.0
+        elif bool(stats.get("soft_lock")):
+            value += 0.8
+        if "pythonapi:pystring" in str(packet.get("label") or "").strip().lower():
+            if bool(eval_data.get("pystring_dialogue_ok")):
+                value -= 1.5
+            else:
+                value -= 6.0
+        stats["value"] = value
+
+        if self._hook_preferred_signature:
+            return
+        current_sig = str(getattr(self, "_hook_auto_signature", "") or "")
+        current_value = float(getattr(self, "_hook_auto_signature_value", float("-inf")) or float("-inf"))
+        if current_sig == sig:
+            self._hook_auto_signature_value = value
+            return
+        if not bool(eval_data.get("lock_ok")):
+            return
+
+        trusted_lock = bool(stats.get("trusted_lock"))
+        soft_lock = bool(stats.get("soft_lock"))
+        count = int(stats.get("count") or 0)
+        good_count = int(stats.get("good_count") or 0)
+        min_count = 1 if trusted_lock else (2 if soft_lock else 3)
+        min_good = 1 if trusted_lock else (2 if soft_lock else 3)
+        min_value = 6.5 if trusted_lock else (9.5 if soft_lock else 12.0)
+        if count < min_count or good_count < min_good or value < min_value:
+            return
+
+        current_stats = self._hook_candidate_stats.get(current_sig, {}) if current_sig else {}
+        current_trusted = bool(current_stats.get("trusted_lock"))
+        if current_sig:
+            if current_trusted and not trusted_lock and value < (current_value + 3.0):
+                return
+            replace_margin = 0.75 if trusted_lock and not current_trusted else 2.0
+            if value < (current_value + replace_margin):
+                return
+
+        self._hook_auto_signature = sig
+        self._hook_auto_signature_value = value
+        self._hook_log_signature_selection(sig, manual=False)
+
+    def _hook_append_intercepted_packet(self, packet: dict, eval_data: dict) -> None:
+        if not bool(eval_data.get("list_ok")):
+            return
+        payload = str(packet.get("text") or "").strip()
+        if not payload:
+            return
+        lw = getattr(self, "hook_intercepted_text_list", None)
+        if lw is None:
+            return
+        item_meta = {"packet": dict(packet), "score": float(eval_data.get("score") or 0.0)}
+        tooltip = self._hook_format_packet_tooltip(packet, eval_data)
+
+        try:
+            if lw.count() > 0:
+                last = lw.item(lw.count() - 1)
+                if last is not None and str(last.text() or "").strip() == payload:
+                    prev = last.data(Qt.ItemDataRole.UserRole)
+                    prev_score = float(prev.get("score") or -999.0) if isinstance(prev, dict) else -999.0
+                    if float(item_meta["score"]) >= prev_score:
+                        last.setData(Qt.ItemDataRole.UserRole, item_meta)
+                        last.setToolTip(tooltip)
+                    return
+        except Exception:
+            pass
+
+        try:
+            it = QListWidgetItem(payload)
+            it.setData(Qt.ItemDataRole.UserRole, item_meta)
+            it.setToolTip(tooltip)
+            lw.addItem(it)
+        except Exception:
+            return
+        try:
+            self._hook_apply_intercepted_filter()
+        except Exception:
+            pass
+        try:
+            lw.scrollToBottom()
+        except Exception:
+            pass
+        try:
+            max_items = 200
+            while lw.count() > max_items:
+                lw.takeItem(0)
+        except Exception:
+            pass
+
+    def _on_hook_packet_received(self, session_id: int, packet) -> None:
+        try:
+            if int(session_id) != int(getattr(self, "_hook_session_id", 0)):
+                return
+        except Exception:
+            pass
+
+        normalized = self._hook_normalize_packet(packet)
+        if normalized is None:
+            return
+
+        payload = str(normalized.get("text") or "").strip()
+        if not payload:
+            return
+
+        self._hook_any_text_received = True
+        eval_data = self._hook_evaluate_packet(normalized)
+
+        try:
+            if self._hook_should_drop_packet(normalized, eval_data):
+                return
+        except Exception:
+            pass
+
+        try:
+            self._hook_recent_packets.append(dict(normalized))
+        except Exception:
+            pass
+
+        signature = str(normalized.get("signature") or "")
+        try:
+            if len(payload) == 1 and payload.isalpha() and payload.isascii():
+                self._hook_pending_prefix = payload
+                self._hook_pending_prefix_ts = float(time.time())
+                self._hook_pending_prefix_signature = signature
+                return
+        except Exception:
+            pass
+
+        try:
+            pfx = str(getattr(self, "_hook_pending_prefix", "") or "")
+            ts = float(getattr(self, "_hook_pending_prefix_ts", 0.0) or 0.0)
+            pfx_sig = str(getattr(self, "_hook_pending_prefix_signature", "") or "")
+            if pfx and len(pfx) == 1 and pfx.isalpha() and pfx.isascii():
+                if pfx_sig and signature == pfx_sig and (time.time() - ts) <= 1.2:
+                    if payload and payload[0].isascii() and payload[0].isalpha() and payload[0].islower():
+                        if not payload.startswith(pfx) and payload[0] != " ":
+                            payload = pfx + payload
+                            normalized["text"] = payload
+                            eval_data = self._hook_evaluate_packet(normalized)
+                            self._hook_update_candidate(normalized, eval_data)
+                self._hook_pending_prefix = ""
+                self._hook_pending_prefix_ts = 0.0
+                self._hook_pending_prefix_signature = ""
+        except Exception:
+            pass
+
+        if payload == str(getattr(self, "_last_hook_text", "") or ""):
+            try:
+                last_ts = float(getattr(self, "_last_hook_text_ts", 0.0) or 0.0)
+            except Exception:
+                last_ts = 0.0
+            if (time.time() - last_ts) <= 0.55:
+                return
+        self._last_hook_text = payload
+        try:
+            self._last_hook_text_ts = float(time.time())
+        except Exception:
+            self._last_hook_text_ts = 0.0
+        try:
+            hook_log(f"TEXT: {payload[:400]}")
+        except Exception:
+            pass
+
+        try:
+            self._hook_append_intercepted_packet(normalized, eval_data)
+        except Exception:
+            pass
+
+        self._hook_update_candidate(normalized, eval_data)
+
+        if payload.startswith("[HOOK_READY]"):
+            return
+
+        try:
+            cb = getattr(self, "hook_realtime_translate_checkbox", None)
+            if cb is not None and not bool(cb.isChecked()):
+                return
+        except Exception:
+            pass
+        try:
+            if not bool(getattr(self, "_hook_learned", False)):
+                return
+        except Exception:
+            return
+
+        active_signature = str(getattr(self, "_hook_preferred_signature", "") or "") or str(getattr(self, "_hook_auto_signature", "") or "")
+        if active_signature:
+            if signature != active_signature:
+                return
+            if bool(eval_data.get("hard_reject")) or float(eval_data.get("score") or 0.0) <= -1.0:
+                return
+        elif not bool(eval_data.get("strong_candidate")):
+            return
+
+        if not self._ensure_overlay():
+            return
+
+        try:
+            self.overlay.show_text_mode(title_text="hook翻译")
+        except Exception:
+            try:
+                self.overlay.show()
+            except Exception:
+                return
+
+        try:
+            self.overlay.original_text.setPlainText(payload)
+        except Exception:
+            pass
+
+        try:
+            src_display = self._get_effective_language_display(for_source=True)
+            tgt_display = self._get_effective_language_display(for_source=False)
+            self.overlay.language_label.setText(f"{src_display} → {tgt_display}")
+        except Exception:
+            pass
+
+        if not self.translator:
+            try:
+                self.overlay.update_translation_result("模型尚未加载完成，请稍候…")
+            except Exception:
+                pass
+            return
+
+        try:
+            self.overlay.update_translation_result("正在翻译…")
+        except Exception:
+            pass
+
+        try:
+            self._start_async_translation(
+                text=payload,
+                source_lang=self._get_effective_language_key(for_source=True),
+                target_lang=self._get_effective_language_key(for_source=False),
+                request_tag="Hook",
+                disable_preprocess=True,
+            )
+        except Exception as e:
+            self.log_message(f"Hook翻译启动失败: {e}")
+
     def _on_hook_text_received(self, session_id: int, text: str) -> None:
+        self._on_hook_packet_received(session_id, {"text": text, "source": "legacy", "label": "legacy"})
+        return
         try:
             if int(session_id) != int(getattr(self, "_hook_session_id", 0)):
                 return
@@ -2958,6 +4049,7 @@ class MainWindow(QMainWindow):
         payload = str(text or "").strip()
         if not payload:
             return
+        self._hook_any_text_received = True
         try:
             if len(payload) == 1 and payload.isalpha() and payload.isascii():
                 self._hook_pending_prefix = payload
@@ -2980,8 +4072,17 @@ class MainWindow(QMainWindow):
             pass
 
         if payload == str(getattr(self, "_last_hook_text", "") or ""):
-            return
+            try:
+                last_ts = float(getattr(self, "_last_hook_text_ts", 0.0) or 0.0)
+            except Exception:
+                last_ts = 0.0
+            if (time.time() - last_ts) <= 0.55:
+                return
         self._last_hook_text = payload
+        try:
+            self._last_hook_text_ts = float(time.time())
+        except Exception:
+            self._last_hook_text_ts = 0.0
         try:
             hook_log(f"TEXT: {payload[:400]}")
         except Exception:
@@ -3056,11 +4157,24 @@ class MainWindow(QMainWindow):
     def _maybe_launch_other_arch(self, status_text: str) -> None:
         if bool(getattr(self, "_hook_arch_switch_prompted", False)):
             return
+        try:
+            p = getattr(self, "_hook_agent_process", None)
+            if p is not None and getattr(p, "poll", None) is not None and p.poll() is None:
+                return
+        except Exception:
+            pass
         target_arch = ""
         s = str(status_text or "")
+        if "Hook架构检测" in s:
+            if "目标进程 x86" in s and "Python x64" in s:
+                target_arch = "x86"
+            elif "目标进程 x64" in s and "Python x86" in s:
+                target_arch = "x64"
         if "Hook需要切换:" in s:
             try:
-                target_arch = s.split("Hook需要切换:", 1)[-1].strip()
+                hinted = s.split("Hook需要切换:", 1)[-1].strip()
+                if hinted in ("x86", "x64") and not target_arch:
+                    target_arch = hinted
             except Exception:
                 target_arch = ""
         if not target_arch:
@@ -3241,7 +4355,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Hook提示", "未获取到目标PID，无法启动注入助手。")
             return
         port = int(self.config.get("hook_port", 37123))
-        prefer_frida_only = bool(self.config.get("hook_prefer_frida_only", True))
+        prefer_frida_only = bool(self.config.get("hook_prefer_frida_only", False))
         args = [str(candidate), "--pid", str(pid), "--port", str(port)]
         if prefer_frida_only:
             args.append("--prefer-frida-only")
@@ -3286,7 +4400,7 @@ class MainWindow(QMainWindow):
         if not agent.exists():
             QMessageBox.warning(self, "Hook提示", f"未找到 hook_agent.py: {agent}")
             return
-        prefer_frida_only = bool(self.config.get("hook_prefer_frida_only", True))
+        prefer_frida_only = bool(self.config.get("hook_prefer_frida_only", False))
         args = cmd + [str(agent), "--pid", str(pid), "--port", str(port)]
         if prefer_frida_only:
             args.append("--prefer-frida-only")
@@ -3298,40 +4412,11 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Hook提示", f"已启动 {target_arch} 注入助手，主程序继续运行。")
 
     def _hook_append_intercepted_text(self, text: str) -> None:
-        if not self._hook_text_basic_filter(text):
+        packet = self._hook_normalize_packet({"text": text, "source": "legacy", "label": "legacy"})
+        if packet is None:
             return
-        payload = str(text or "").strip()
-        if not payload:
-            return
-        lw = getattr(self, "hook_intercepted_text_list", None)
-        if lw is None:
-            return
-        try:
-            if lw.count() > 0:
-                last = lw.item(lw.count() - 1)
-                if last is not None and str(last.text() or "").strip() == payload:
-                    return
-        except Exception:
-            pass
-
-        try:
-            lw.addItem(payload)
-        except Exception:
-            return
-        try:
-            self._hook_apply_intercepted_filter()
-        except Exception:
-            pass
-        try:
-            lw.scrollToBottom()
-        except Exception:
-            pass
-        try:
-            max_items = 200
-            while lw.count() > max_items:
-                lw.takeItem(0)
-        except Exception:
-            pass
+        eval_data = self._hook_evaluate_packet(packet)
+        self._hook_append_intercepted_packet(packet, eval_data)
 
     def _hook_clear_intercepted_texts(self, *_args) -> None:
         lw = getattr(self, "hook_intercepted_text_list", None)
@@ -3347,14 +4432,286 @@ class MainWindow(QMainWindow):
             pass
 
     @staticmethod
+    def _hook_label_profile(label: str) -> dict:
+        ll = str(label or "").strip().lower()
+        profile = {
+            "score": 0.0,
+            "trusted_lock": False,
+            "soft_lock": False,
+            "lock_block": False,
+            "glyph": False,
+            "engine_noise": False,
+            "pystring": False,
+            "pystring_soft_lock": False,
+        }
+        if not ll:
+            return profile
+        if ll.startswith("renpy:patch:say_menu_text_filter"):
+            profile["score"] -= 9.0
+            profile["engine_noise"] = True
+            profile["lock_block"] = True
+        elif ll.startswith("renpy:patch:"):
+            profile["score"] += 8.5
+            profile["trusted_lock"] = True
+            profile["soft_lock"] = True
+        elif ll.startswith("renpy:text:") or ll.startswith("renpy:dtext:"):
+            profile["score"] += 7.5
+            profile["trusted_lock"] = True
+            profile["soft_lock"] = True
+        elif ll.startswith("renpy:character:"):
+            profile["score"] += 6.5
+            profile["trusted_lock"] = True
+            profile["soft_lock"] = True
+        elif ll.startswith("renpy:interact:last_say_what"):
+            profile["score"] += 5.5
+            profile["soft_lock"] = True
+        elif ll.startswith("renpy:interact:screen:"):
+            profile["score"] += 5.5
+            profile["soft_lock"] = True
+        elif ll.startswith("renpy:interact:last_say"):
+            profile["score"] += 4.5
+            profile["soft_lock"] = True
+        elif ll.startswith("renpy:interact:history_current"):
+            profile["score"] += 4.0
+            profile["soft_lock"] = True
+        elif ll.startswith("renpy:poll:last_say_what"):
+            profile["score"] += 4.5
+            profile["soft_lock"] = True
+        elif ll.startswith("renpy:poll:screen:"):
+            profile["score"] += 5.0
+            profile["soft_lock"] = True
+        elif ll.startswith("renpy:poll:last_say"):
+            profile["score"] += 3.5
+            profile["soft_lock"] = True
+        elif ll.startswith("renpy:poll:history_current"):
+            profile["score"] += 2.0
+            profile["lock_block"] = True
+        elif ll.startswith("renpy:poll:history"):
+            profile["score"] -= 5.5
+            profile["lock_block"] = True
+        elif ll.startswith("renpy:ready"):
+            profile["score"] -= 10.0
+            profile["engine_noise"] = True
+        elif "renpy" in ll:
+            profile["score"] += 2.0
+            profile["soft_lock"] = True
+        if ll.startswith("sdl_ttf_utf8") or ll.startswith("sdl_ttf_unicode"):
+            profile["score"] += 7.0
+            profile["trusted_lock"] = True
+            profile["soft_lock"] = True
+        elif ll.startswith("sdl_ttf_glyph"):
+            profile["score"] -= 4.5
+            profile["glyph"] = True
+        elif "pythonapi:" in ll:
+            if "pyunicode" in ll or "decodeutf8" in ll:
+                profile["score"] += 2.5
+                profile["soft_lock"] = True
+            elif "decode" in ll:
+                profile["score"] += 1.5
+                profile["soft_lock"] = True
+            elif "pystring_fromstringandsize" in ll or "pystring_fromstring" in ll:
+                profile["score"] -= 8.0
+                profile["pystring"] = True
+                profile["engine_noise"] = True
+                profile["lock_block"] = True
+            else:
+                profile["score"] -= 1.5
+        elif any(name in ll for name in ("textout", "drawtext", "exttextout")):
+            profile["score"] += 2.5
+            profile["soft_lock"] = True
+        if any(name in ll for name in ("glyphoutline", "multibytetowidechar", "gettextextent", "createfont")):
+            profile["score"] -= 7.0
+            profile["engine_noise"] = True
+        return profile
+
+    @staticmethod
+    def _hook_is_live_dialogue_label(label: str) -> bool:
+        ll = str(label or "").strip().lower()
+        if not ll:
+            return False
+        if ll.startswith("renpy:patch:say_menu_text_filter"):
+            return False
+        if ll.startswith("renpy:patch:") or ll.startswith("renpy:text:") or ll.startswith("renpy:dtext:"):
+            return True
+        if ll.startswith("renpy:character:") or ll.startswith("renpy:interact:"):
+            return True
+        if ll.startswith("renpy:poll:screen:") or ll.startswith("renpy:poll:last_say_what") or ll.startswith("renpy:poll:last_say"):
+            return True
+        return False
+
+    @staticmethod
+    def _hook_is_transport_noise(text: str, label: str, source: str) -> bool:
+        t = str(text or "").strip()
+        if not t:
+            return True
+        tl = t.lower()
+        ll = str(label or "").strip().lower()
+        sl = str(source or "").strip().lower()
+        if sl == "frida":
+            if tl in ("text", "label", "source", "socket"):
+                return True
+            if re.fullmatch(r"\"?(?:text|label|source|socket)\"?", tl):
+                return True
+            if re.fullmatch(r"\"?renpy:[a-z0-9:_-]+\"?", tl):
+                return True
+            if ll.startswith("multibytetowidechar") and tl in ("style", "screen", "dissolve(", "return", "python:", "label", "c:"):
+                return True
+        return False
+
+    def _hook_should_drop_packet(self, packet: dict, eval_data: dict) -> bool:
+        payload = str(packet.get("text") or "").strip()
+        label = str(packet.get("label") or "").strip().lower()
+        source = str(packet.get("source") or "").strip().lower()
+        now_ts = float(time.time())
+
+        if self._hook_is_transport_noise(payload, label, source):
+            return True
+
+        if label.startswith("renpy:patch:say_menu_text_filter"):
+            return True
+
+        if label.startswith("pythonapi:pystring_fromstringandsize") or label.startswith("pythonapi:pystring_fromstring"):
+            return True
+
+        if label.startswith("multibytetowidechar"):
+            return True
+
+        if label.startswith("renpy:poll:history") and not label.startswith("renpy:poll:history_current"):
+            return True
+
+        if label.startswith("renpy:poll:history_current"):
+            start_ts = float(getattr(self, "_hook_start_ts", 0.0) or 0.0)
+            if start_ts > 0.0 and (now_ts - start_ts) <= 1.5:
+                return True
+
+        if self._hook_is_live_dialogue_label(label) and not bool(eval_data.get("hard_reject")):
+            self._hook_live_dialogue_ts = now_ts
+            self._hook_live_dialogue_label = label
+            self._hook_live_dialogue_text = payload
+            return False
+
+        if label.startswith("renpy:poll:history"):
+            live_ts = float(getattr(self, "_hook_live_dialogue_ts", 0.0) or 0.0)
+            if live_ts > 0.0 and (now_ts - live_ts) <= 15.0:
+                return True
+
+        return False
+
+    @staticmethod
+    def _hook_text_is_dialogue_like(text: str) -> bool:
+        t = str(text or "").strip()
+        if not t:
+            return False
+        if MainWindow._hook_text_is_code_like(t):
+            return False
+        if re.search(r"[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]", t):
+            return True
+        if not re.search(r"[A-Za-z]", t):
+            return False
+        if " " in t and len(t) >= 6:
+            return True
+        if len(t) >= 4 and re.search(r"[.!?\"']$", t):
+            return True
+        if len(t) >= 14 and re.fullmatch(r"[A-Za-z0-9 ,;:'\"!?-]+", t):
+            return True
+        return False
+
+    @staticmethod
+    def _hook_text_is_code_like(text: str) -> bool:
+        t = str(text or "").strip()
+        if not t:
+            return False
+        tl = t.lower()
+        if re.search(r"(==|!=|<=|>=|::|->|\{#|\breturn\b|\blabel\b|\bpython:)", tl):
+            return True
+        if re.search(r"\b(?:if|elif|else|and|or|not|while|for|lambda|screen|transform|show|hide|jump|call)\b", tl) and any(ch in t for ch in "(){}[]=_."):
+            return True
+        if re.fullmatch(r"\([^)]*\)", t) and re.search(r"\b(?:not|and|or|if|elif|else)\b", tl):
+            return True
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\([^)]*\)", t):
+            return True
+        if re.search(r"\b[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\b", tl):
+            return True
+        if re.fullmatch(r"\.[A-Za-z0-9]{2,5}", t):
+            return True
+        if re.fullmatch(r"[A-Za-z0-9_.-]+\.(?:png|jpe?g|ogg|mp3|wav|dll|exe|rpy|rpa|save)", tl):
+            return True
+        if t.count("_") >= 2 and " " not in t and not re.search(r"[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]", t):
+            return True
+        return False
+
+    @staticmethod
     def _hook_text_basic_filter(text: str) -> bool:
         t = str(text or "").strip()
         if not t:
             return False
-        if len(t) < 2:
+        tl = t.lower()
+        if tl in ("doki doki literature club!",):
             return False
+        if MainWindow._hook_text_is_code_like(t):
+            return False
+        fatal_substrings = (
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".ogg",
+            ".mp3",
+            ".wav",
+            ".dll",
+            ".exe",
+            ".rpy",
+            ".rpa",
+            ".save",
+            "traceback",
+            "syntaxerror",
+            "must be unicode",
+            "expected a character buffer object",
+            "string index out of range",
+            "bytearray index out of range",
+            "unexpected character after line continuation character",
+            "primary display bounds",
+            "window was restored",
+            "windowed mode",
+            "screen sizes:",
+            "persistent.",
+            "main_menu",
+            "menu_art_",
+            "menu_bg",
+            "viewport",
+            "style_prefix",
+            "button_text",
+            "say_window",
+            "keymap",
+            "xalign",
+            "yalign",
+            "child_size",
+            "py_repr",
+            "file \"",
+        )
+        if any(bad in tl for bad in fatal_substrings):
+            return False
+        if re.fullmatch(r"[a-z][a-z0-9_]*", tl) and "_" in tl:
+            return False
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*", t) and "_" in t:
+            return False
+        if re.fullmatch(r"[A-Za-z]:", t):
+            return False
+        if re.fullmatch(r"\d+\s*[-_/.:]\s*\d+", t):
+            return False
+        if re.search(r"(?:^|[\s\"'])[\w./\\-]+\.(?:png|jpe?g|ogg|mp3|wav|dll|exe|rpy|rpa|save)\b", tl):
+            return False
+        if any(((ord(ch) < 32 and not ch.isspace()) or ch in ("\ufffd", "")) for ch in t):
+            return False
+        if len(t) == 1:
+            ch = t[0]
+            cp = ord(ch)
+            is_cjk = 0x4E00 <= cp <= 0x9FFF
+            is_kana = 0x3040 <= cp <= 0x30FF
+            is_hangul = 0xAC00 <= cp <= 0xD7AF
+            return bool(ch.isalnum() or is_cjk or is_kana or is_hangul)
         total = 0
         bad = 0
+        has_cjk_like = False
         for ch in t:
             if ch.isspace():
                 continue
@@ -3363,15 +4720,19 @@ class MainWindow(QMainWindow):
             is_cjk = 0x4E00 <= cp <= 0x9FFF
             is_kana = 0x3040 <= cp <= 0x30FF
             is_hangul = 0xAC00 <= cp <= 0xD7AF
+            if is_cjk or is_kana or is_hangul:
+                has_cjk_like = True
             if not (ch.isalnum() or is_cjk or is_kana or is_hangul):
                 bad += 1
         if total <= 0:
             return False
+        if has_cjk_like and len(t) <= 3:
+            return True
         try:
             bad_ratio = float(bad) / float(total)
         except Exception:
             bad_ratio = 0.0
-        if bad_ratio > 0.6:
+        if bad_ratio > 0.70:
             return False
         return True
 
@@ -3399,6 +4760,95 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._hook_agent_process = None
+
+    def _terminate_orphan_hook_agents(self) -> None:
+        """Best-effort cleanup for leaked HookAgent/helper processes."""
+        target_port = ""
+        try:
+            target_port = str(int(self.config.get("hook_port", 37123)))
+        except Exception:
+            target_port = "37123"
+        killed = 0
+
+        try:
+            import psutil  # type: ignore
+        except Exception:
+            psutil = None
+
+        def _is_hook_agent_cmd(cmdline: list[str]) -> bool:
+            if not cmdline:
+                return False
+            lower = [str(x or "").lower() for x in cmdline]
+            joined = " ".join(lower)
+            if "hookagent.exe" in joined or "hook_agent.py" in joined:
+                return True
+            return False
+
+        def _matches_port(cmdline: list[str]) -> bool:
+            if not cmdline:
+                return True
+            try:
+                for i, a in enumerate(cmdline):
+                    if str(a).strip().lower() == "--port":
+                        if i + 1 < len(cmdline) and str(cmdline[i + 1]).strip() == target_port:
+                            return True
+                # If no --port provided, still allow kill when command is explicit HookAgent binary.
+                joined = " ".join([str(x or "").lower() for x in cmdline])
+                if "hookagent.exe" in joined:
+                    return True
+            except Exception:
+                return True
+            return False
+
+        if psutil is not None:
+            try:
+                for p in psutil.process_iter(["pid", "name", "cmdline"]):
+                    try:
+                        if int(p.pid) == int(os.getpid()):
+                            continue
+                        cmd = list(p.info.get("cmdline") or [])
+                        if not _is_hook_agent_cmd(cmd):
+                            continue
+                        if not _matches_port(cmd):
+                            continue
+                        try:
+                            p.terminate()
+                        except Exception:
+                            pass
+                        try:
+                            p.wait(timeout=1.0)
+                        except Exception:
+                            pass
+                        try:
+                            if p.is_running():
+                                p.kill()
+                        except Exception:
+                            pass
+                        killed += 1
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        # Fallback for Windows when psutil missing or missed detached process.
+        if os.name == "nt":
+            try:
+                import subprocess
+                # Kill packaged helper by image name (best-effort).
+                subprocess.run(
+                    ["taskkill", "/F", "/IM", "HookAgent.exe", "/T"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=2,
+                )
+            except Exception:
+                pass
+
+        if killed > 0:
+            try:
+                self.log_message(f"Hook助手清理: 已结束 {killed} 个残留进程")
+            except Exception:
+                pass
 
     def _hook_apply_intercepted_filter(self, *_args) -> None:
         lw = getattr(self, "hook_intercepted_text_list", None)
@@ -3455,23 +4905,16 @@ class MainWindow(QMainWindow):
             it = None
         if it is None:
             return
-        sample_text = ""
         try:
-            sample_text = str(it.text() or "").strip()
+            meta = it.data(Qt.ItemDataRole.UserRole)
         except Exception:
-            sample_text = ""
-        if not sample_text:
+            meta = None
+        packet = meta.get("packet") if isinstance(meta, dict) else None
+        signature = str(packet.get("signature") or "").strip() if isinstance(packet, dict) else ""
+        if not signature:
             return
-        th = getattr(self, "_hook_scan_thread", None)
-        try:
-            if th is None or not th.isRunning():
-                return
-        except Exception:
-            return
-        try:
-            th.request_learn(sample_text)
-        except Exception:
-            pass
+        self._hook_preferred_signature = signature
+        self._hook_log_signature_selection(signature, manual=True)
 
     def _hook_translate_selected_text(self, *_args) -> None:
         lw = getattr(self, "hook_intercepted_text_list", None)
@@ -3543,6 +4986,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         try:
+            self._terminate_orphan_hook_agents()
+        except Exception:
+            pass
+        try:
             self._hook_session_id = int(getattr(self, "_hook_session_id", 0)) + 1
         except Exception:
             self._hook_session_id = 1
@@ -3564,6 +5011,23 @@ class MainWindow(QMainWindow):
         self._hook_running = False
         try:
             self._hook_learned = False
+            self._hook_candidate_stats = {}
+            self._hook_recent_packets = deque(maxlen=256)
+            self._hook_preferred_signature = ""
+            self._hook_auto_signature = ""
+            self._hook_auto_signature_value = float("-inf")
+            self._hook_selected_signature_logged = ""
+            self._hook_pending_prefix = ""
+            self._hook_pending_prefix_ts = 0.0
+            self._hook_pending_prefix_signature = ""
+            self._hook_start_ts = 0.0
+            self._hook_startup_ignore_until = 0.0
+            self._hook_startup_suppressed_logged = False
+            self._hook_startup_buffer_packet = None
+            self._hook_live_dialogue_ts = 0.0
+            self._hook_live_dialogue_label = ""
+            self._hook_live_dialogue_text = ""
+            self._last_hook_text_ts = 0.0
         except Exception:
             pass
         self.translation_status_label.setText("翻译服务: 未启用")
@@ -3756,6 +5220,9 @@ class MainWindow(QMainWindow):
             <li>ctrl+滚轮可以调节历史记录页面大小</li>
             <li>hook模式只需要选择游戏进程<b>目前是beta版，可能不兼容或出现bug</b></li>
             <li>可以设置快捷键<b>Windows10用户可能需要用管理员权限启动才能修改快捷键</b></li>
+            <li>API接入（LM Studio/Ollama）：BaseURL 可填 LM Studio 的 http://localhost:1234/v1 或 http://localhost:1234/api/v0；Ollama 的 http://localhost:11434/api/chat 或 http://localhost:11434/api/generate。</li>
+            <li>API模型名称只填写模型名（例如 llama3.1、qwen2.5:14b）。</li>
+            <li>常见错误：500 open .../api/chat/latest 表示模型名写成了 BaseURL；404/Unexpected endpoint 表示 BaseURL 路径写错；连接失败多为服务未启动或模型未加载。</li>
             <li><b>还有问题以及支持我们到官网https://14ku.date/support</b></li>
         </ul>
         """
@@ -4472,6 +5939,467 @@ class MainWindow(QMainWindow):
 
         # 更新按钮上的快捷键信息
         self.update_translate_button_label()
+
+    def _save_api_base_url_setting(self) -> None:
+        try:
+            base_url = str(self.api_base_url_edit.text() or "").strip()
+        except Exception:
+            base_url = ""
+        self._api_base_url = base_url
+        try:
+            self.config_manager.set("api", "base_url", base_url)
+        except Exception:
+            pass
+        if self._api_enabled:
+            try:
+                if str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
+                    self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
+                    self.translator = self._api_translator
+                else:
+                    self._api_translator = None
+                    self.translator = None
+            except Exception:
+                self._api_translator = None
+                self.translator = None
+            try:
+                self.update_translate_button_label()
+            except Exception:
+                pass
+            self._start_api_provider_probe()
+
+    def _save_api_key_setting(self) -> None:
+        try:
+            api_key = str(self.api_key_edit.text() or "").strip()
+        except Exception:
+            api_key = ""
+        self._api_key = api_key
+        try:
+            self.config_manager.set("api", "api_key", api_key)
+        except Exception:
+            pass
+        if self._api_enabled:
+            try:
+                if str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
+                    self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
+                    self.translator = self._api_translator
+            except Exception:
+                pass
+            try:
+                self.update_translate_button_label()
+            except Exception:
+                pass
+            self._start_api_provider_probe()
+
+    def _save_api_models_to_config(self) -> None:
+        try:
+            import json
+            self.config_manager.set("api", "models", json.dumps(list(self._api_models or []), ensure_ascii=False))
+        except Exception:
+            try:
+                self.config_manager.set("api", "models", "\n".join(list(self._api_models or [])))
+            except Exception:
+                pass
+
+    def _refresh_api_models_ui(self) -> None:
+        try:
+            lw = getattr(self, "api_model_list", None)
+            if lw is None:
+                return
+            lw.blockSignals(True)
+            try:
+                lw.clear()
+                for model in list(self._api_models or []):
+                    m = str(model or "").strip()
+                    if not m:
+                        continue
+                    item = QListWidgetItem()
+                    item.setData(Qt.ItemDataRole.UserRole, m)
+
+                    row = QWidget()
+                    row_layout = QHBoxLayout(row)
+                    row_layout.setContentsMargins(0, 0, 0, 0)
+                    row_layout.setSpacing(self._scale_size(6))
+                    label = QLabel(m)
+                    row_layout.addWidget(label, 1)
+                    del_btn = QToolButton()
+                    del_btn.setText("-")
+                    try:
+                        del_btn.setFixedSize(self._scale_size(22), self._scale_size(22))
+                    except Exception:
+                        pass
+                    del_btn.clicked.connect(lambda _=False, mm=m: self._delete_api_model(mm))
+                    row_layout.addWidget(del_btn, 0, Qt.AlignmentFlag.AlignRight)
+
+                    item.setSizeHint(QSize(0, self._scale_size(28)))
+                    lw.addItem(item)
+                    lw.setItemWidget(item, row)
+
+                cur = str(self._api_model or "").strip()
+                if cur:
+                    for i in range(lw.count()):
+                        it = lw.item(i)
+                        if str(it.data(Qt.ItemDataRole.UserRole) or "") == cur:
+                            lw.setCurrentItem(it)
+                            break
+            finally:
+                lw.blockSignals(False)
+        except Exception:
+            pass
+
+    def _add_api_model_dialog(self) -> None:
+        try:
+            text, ok = QInputDialog.getText(self, "添加模型", "请输入模型名称:")
+        except Exception:
+            return
+        if not ok:
+            return
+        model = str(text or "").strip()
+        if not model:
+            return
+        if model not in self._api_models:
+            self._api_models.append(model)
+            self._save_api_models_to_config()
+        self._api_model = model
+        try:
+            self.config_manager.set("api", "model", model)
+        except Exception:
+            pass
+        if self._api_enabled and str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
+            try:
+                self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
+                self.translator = self._api_translator
+            except Exception:
+                self._api_translator = None
+                self.translator = None
+        self._refresh_api_models_ui()
+        try:
+            self.update_translate_button_label()
+        except Exception:
+            pass
+        self._refresh_system_status()
+
+    def _delete_api_model(self, model: str) -> None:
+        m = str(model or "").strip()
+        if not m:
+            return
+        try:
+            self._api_models = [x for x in list(self._api_models or []) if str(x) != m]
+        except Exception:
+            pass
+        if str(self._api_model or "").strip() == m:
+            self._api_model = ""
+            try:
+                self.config_manager.set("api", "model", "")
+            except Exception:
+                pass
+            try:
+                self._api_translator = None
+                self.translator = None
+            except Exception:
+                pass
+        self._save_api_models_to_config()
+        self._refresh_api_models_ui()
+        try:
+            self.update_translate_button_label()
+        except Exception:
+            pass
+        self._refresh_system_status()
+
+    def _on_api_model_selected(self, current: QListWidgetItem, _previous: QListWidgetItem) -> None:
+        try:
+            if current is None:
+                return
+            model = str(current.data(Qt.ItemDataRole.UserRole) or "").strip()
+        except Exception:
+            model = ""
+        if not model:
+            return
+        self._api_model = model
+        try:
+            self.config_manager.set("api", "model", model)
+        except Exception:
+            pass
+        if self._api_enabled and str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
+            try:
+                self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
+                self.translator = self._api_translator
+            except Exception:
+                self._api_translator = None
+                self.translator = None
+        try:
+            self.update_translate_button_label()
+        except Exception:
+            pass
+        self._refresh_system_status()
+
+    def _toggle_api_service_enabled(self) -> None:
+        enabled = None
+        try:
+            enabled = bool(self.api_enable_button.isChecked())
+        except Exception:
+            enabled = None
+        if enabled is None:
+            enabled = not bool(self._api_enabled)
+        self._set_api_service_enabled(bool(enabled))
+
+    def _set_api_service_enabled(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        self._api_enabled = enabled
+        try:
+            self.config_manager.set("api", "enabled", "true" if enabled else "false")
+        except Exception:
+            pass
+
+        if enabled:
+            self._unload_local_translator()
+            try:
+                if str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
+                    self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
+                    self.translator = self._api_translator
+                else:
+                    self._api_translator = None
+                    self.translator = None
+            except Exception:
+                self._api_translator = None
+                self.translator = None
+        else:
+            self._api_translator = None
+            try:
+                self.translator = None
+            except Exception:
+                pass
+            if not self.translator:
+                self._begin_async_translator_init()
+
+        self._apply_api_service_ui_state()
+        try:
+            self.update_translate_button_label()
+        except Exception:
+            pass
+        self._refresh_system_status()
+
+    def _apply_api_service_ui_state(self) -> None:
+        try:
+            if hasattr(self, "api_enable_button") and self.api_enable_button is not None:
+                try:
+                    self.api_enable_button.setChecked(bool(self._api_enabled))
+                except Exception:
+                    pass
+                self.api_enable_button.setText("关闭API服务" if self._api_enabled else "启用API服务")
+                if self._api_enabled:
+                    self._set_scaled_stylesheet(
+                        self.api_enable_button,
+                        """
+                        QPushButton { background-color: #f44336; color: white; font-weight: bold; padding: 10px; border-radius: 6px; }
+                        QPushButton:hover { background-color: #d32f2f; }
+                        QPushButton:pressed { background-color: #b71c1c; }
+                        """,
+                    )
+                else:
+                    self._set_scaled_stylesheet(
+                        self.api_enable_button,
+                        """
+                        QPushButton { background-color: #4caf50; color: white; font-weight: bold; padding: 10px; border-radius: 6px; }
+                        QPushButton:hover { background-color: #43a047; }
+                        QPushButton:pressed { background-color: #2e7d32; }
+                        """,
+                    )
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "api_provider_status_label") and self.api_provider_status_label is not None:
+                self.api_provider_status_label.setVisible(bool(self._api_enabled))
+        except Exception:
+            pass
+
+        try:
+            self._refresh_api_models_ui()
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "model_status_label") and self.model_status_label is not None:
+                self.model_status_label.setVisible(not bool(self._api_enabled))
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "model_resource_label") and self.model_resource_label is not None:
+                self.model_resource_label.setVisible(not bool(self._api_enabled))
+        except Exception:
+            pass
+
+        try:
+            if self._api_enabled:
+                try:
+                    if hasattr(self, "text_mode_button") and self.text_mode_button is not None:
+                        self.text_mode_button.setEnabled(bool(self.translator))
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "hook_mode_button") and self.hook_mode_button is not None:
+                        self.hook_mode_button.setEnabled(True)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "test_button") and self.test_button is not None:
+                        self.test_button.setEnabled(bool(self._components_ready_for_work()))
+                except Exception:
+                    pass
+                try:
+                    self.update_translate_button_label()
+                except Exception:
+                    pass
+            else:
+                try:
+                    if hasattr(self, "text_mode_button") and self.text_mode_button is not None:
+                        self.text_mode_button.setEnabled(bool(self.translator))
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "hook_mode_button") and self.hook_mode_button is not None:
+                        self.hook_mode_button.setEnabled(True)
+                except Exception:
+                    pass
+                try:
+                    if hasattr(self, "test_button") and self.test_button is not None:
+                        self.test_button.setEnabled(bool(self._components_ready_for_work()))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        if self._api_enabled:
+            self._start_api_provider_probe()
+
+    def _start_api_provider_probe(self) -> None:
+        try:
+            if not self._api_enabled:
+                return
+        except Exception:
+            return
+
+        base_url = str(self._api_base_url or "").strip()
+        api_key = str(self._api_key or "").strip()
+        if not base_url:
+            self._api_provider_probe_ok = False
+            self._api_provider_probe_message = "未填写BaseURL"
+            try:
+                self.api_provider_status_label.setText(f"API服务商: {self._api_provider_probe_message}")
+            except Exception:
+                pass
+            return
+
+        try:
+            if self._api_probe_thread is not None and self._api_probe_thread.isRunning():
+                return
+        except Exception:
+            pass
+
+        self._api_provider_probe_ok = None
+        self._api_provider_probe_message = "检测中…"
+        try:
+            self.api_provider_status_label.setText("API服务商: 检测中…")
+        except Exception:
+            pass
+
+        th = _ApiProviderProbeThread(base_url=base_url, api_key=api_key, timeout_sec=3.0)
+        self._api_probe_thread = th
+        th.probe_finished.connect(self._on_api_provider_probe_finished)
+        th.start()
+
+    def _on_api_provider_probe_finished(self, ok: bool, message: str) -> None:
+        self._api_provider_probe_ok = bool(ok)
+        self._api_provider_probe_message = str(message or "").strip()
+        self._refresh_system_status()
+
+    def _begin_async_translator_init(self) -> None:
+        if self._api_enabled:
+            return
+        try:
+            if getattr(self, "_translator_init_thread", None) is not None and self._translator_init_thread.isRunning():
+                return
+        except Exception:
+            pass
+
+        try:
+            if hasattr(self, "translate_button") and self.translate_button is not None:
+                self.translate_button.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "text_mode_button") and self.text_mode_button is not None:
+                self.text_mode_button.setEnabled(False)
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "test_button") and self.test_button is not None:
+                self.test_button.setEnabled(False)
+        except Exception:
+            pass
+
+        th = _TranslatorInitThread(model_path=getattr(self, "_model_path_for_init", None))
+        self._translator_init_thread = th
+        th.progress.connect(self._on_init_progress)
+        th.init_finished.connect(self._on_translator_init_finished)
+        th.start()
+
+    def _on_translator_init_finished(self, success: bool, translator: object, stats: dict) -> None:
+        if self._api_enabled:
+            try:
+                if translator is not None and hasattr(translator, "unload_model"):
+                    translator.unload_model()
+            except Exception:
+                pass
+            return
+
+        if success and translator is not None:
+            self.translator = translator
+            try:
+                self._component_stats["translator"] = stats or {}
+            except Exception:
+                pass
+            try:
+                dev = str(getattr(self.translator, "device", "") or "").lower()
+                self._gpu_stats_enabled = (dev == "cuda")
+            except Exception:
+                self._gpu_stats_enabled = False
+
+        try:
+            if hasattr(self, "text_mode_button") and self.text_mode_button is not None:
+                self.text_mode_button.setEnabled(bool(self.translator))
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "test_button") and self.test_button is not None:
+                self.test_button.setEnabled(bool(self._components_ready_for_work()))
+        except Exception:
+            pass
+        try:
+            self.update_translate_button_label()
+        except Exception:
+            pass
+        self._refresh_system_status()
+
+    def _unload_local_translator(self) -> None:
+        try:
+            if self.translator is not None and hasattr(self.translator, "unload_model"):
+                self.translator.unload_model()
+        except Exception:
+            pass
+        try:
+            self.translator = None
+        except Exception:
+            pass
+        try:
+            self._gpu_stats_enabled = False
+        except Exception:
+            pass
+        try:
+            self._component_stats["translator"] = {}
+        except Exception:
+            pass
         
     def save_ocr_settings(self):
         """保存OCR设置"""
@@ -4894,6 +6822,10 @@ class MainWindow(QMainWindow):
 
         try:
             self._terminate_hook_agent_process()
+        except Exception:
+            pass
+        try:
+            self._terminate_orphan_hook_agents()
         except Exception:
             pass
             

@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 import threading
 import time
+import os
+import sys
+import re
 from array import array
 from collections import deque
 
@@ -129,6 +132,7 @@ def _ensure_hidden_console_for_console_children() -> None:
 
 class HookTextThread(QThread):
     text_received = pyqtSignal(str)
+    packet_received = pyqtSignal(object)
     status = pyqtSignal(str)
 
     def __init__(
@@ -166,6 +170,9 @@ class HookTextThread(QThread):
         self._last_text = ""
         self._seen = deque(maxlen=300)
         self._seen_set: set[int] = set()
+        self._packet_seen = deque(maxlen=800)
+        self._packet_seen_set: set[int] = set()
+        self._packet_last_emit_ts: dict[tuple[str, str, int, str], float] = {}
         self._win_event_proc = None
         self._hooks = []
         self._server_thread = None
@@ -176,9 +183,55 @@ class HookTextThread(QThread):
         self._frida_thread = None
         self._frida_stop = threading.Event()
         self._agent_process = None
+        self._enable_renpy_injection = self._resolve_renpy_injection_enabled()
+
+    @staticmethod
+    def _parse_bool(raw, default: bool = False) -> bool:
+        try:
+            if isinstance(raw, bool):
+                return bool(raw)
+            s = str(raw or "").strip().lower()
+        except Exception:
+            return bool(default)
+        if not s:
+            return bool(default)
+        if s in ("1", "true", "yes", "on", "enabled"):
+            return True
+        if s in ("0", "false", "no", "off", "disabled"):
+            return False
+        return bool(default)
+
+    def _resolve_renpy_injection_enabled(self) -> bool:
+        # Default ON: the injected Ren'Py poller is read-only and is the most reliable
+        # way to get dialogue from Ren'Py titles like DDLC without depending on render hooks.
+        enabled = True
+        try:
+            import configparser
+            from pathlib import Path
+
+            cfg = configparser.ConfigParser()
+            ini_paths = [
+                Path(os.getcwd()) / "config" / "settings.ini",
+                Path(__file__).resolve().parents[2] / "config" / "settings.ini",
+            ]
+            for p in ini_paths:
+                if not p.exists():
+                    continue
+                cfg.read(str(p), encoding="utf-8")
+                if cfg.has_option("hook", "renpy_injection"):
+                    enabled = self._parse_bool(cfg.get("hook", "renpy_injection"), False)
+                    break
+        except Exception:
+            pass
+        try:
+            env = os.environ.get("SCREEN_TRANSLATOR_RENPY_INJECTION")
+            if env is not None and str(env).strip() != "":
+                enabled = self._parse_bool(env, enabled)
+        except Exception:
+            pass
+        return bool(enabled)
 
     def _find_32bit_agent(self) -> str | None:
-        import os
         # Base candidates relative to CWD
         candidates = [
             # 1. dist/ScreenTranslator-x86/HookAgent/HookAgent.exe
@@ -201,6 +254,119 @@ class HookTextThread(QThread):
                 return c
         return None
 
+    def _is_32bit_python_cmd(self, cmd: list[str]) -> bool:
+        try:
+            import subprocess
+        except Exception:
+            return False
+        try:
+            startupinfo = None
+            creationflags = 0
+            if os.name == "nt":
+                try:
+                    startupinfo = subprocess.STARTUPINFO()
+                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                    startupinfo.wShowWindow = 0
+                except Exception:
+                    startupinfo = None
+                try:
+                    creationflags |= subprocess.CREATE_NO_WINDOW
+                except Exception:
+                    pass
+            result = subprocess.run(
+                cmd + ["-c", "import struct,sys;sys.exit(0 if struct.calcsize('P')==4 else 1)"],
+                capture_output=True,
+                timeout=3,
+                startupinfo=startupinfo,
+                creationflags=creationflags,
+            )
+            return int(result.returncode or 1) == 0
+        except Exception:
+            return False
+
+    def _resolve_py32_cmd(self) -> list[str] | None:
+        try:
+            import subprocess
+        except Exception:
+            return None
+        candidates: list[list[str]] = []
+
+        # 1) settings.ini [hook] py32
+        try:
+            import configparser
+            from pathlib import Path
+            cfg = configparser.ConfigParser()
+            ini_paths = [
+                Path(os.getcwd()) / "config" / "settings.ini",
+                Path(__file__).resolve().parents[2] / "config" / "settings.ini",
+            ]
+            for p in ini_paths:
+                if not p.exists():
+                    continue
+                cfg.read(str(p), encoding="utf-8")
+                if cfg.has_option("hook", "py32"):
+                    py32 = str(cfg.get("hook", "py32") or "").strip()
+                    if py32:
+                        candidates.append([py32])
+                    break
+        except Exception:
+            pass
+
+        # 2) env
+        for k in ("SCREEN_TRANSLATOR_PY32", "PY32"):
+            v = str(os.environ.get(k) or "").strip()
+            if v:
+                candidates.append([v])
+
+        # 3) py launcher
+        try:
+            if subprocess.run(["py", "--version"], capture_output=True, timeout=2).returncode == 0:
+                candidates.append(["py", "-3-32"])
+        except Exception:
+            pass
+
+        # 4) common install locations
+        try:
+            from pathlib import Path
+            bases = [
+                os.environ.get("LOCALAPPDATA"),
+                os.environ.get("ProgramFiles(x86)"),
+                os.environ.get("ProgramFiles"),
+            ]
+            for base in [b for b in bases if b]:
+                bp = Path(base)
+                for p in bp.glob("Programs/Python/Python3*-32/python.exe"):
+                    candidates.append([str(p)])
+                for p in bp.glob("Python3*-32/python.exe"):
+                    candidates.append([str(p)])
+        except Exception:
+            pass
+
+        seen: set[tuple[str, ...]] = set()
+        for cmd in candidates:
+            key = tuple(cmd)
+            if key in seen:
+                continue
+            seen.add(key)
+            if self._is_32bit_python_cmd(cmd):
+                return cmd
+        return None
+
+    def _find_source_hook_agent(self) -> str | None:
+        try:
+            from pathlib import Path
+            candidates = [
+                Path(os.getcwd()) / "hook_agent.py",
+                Path(__file__).resolve().parents[2] / "hook_agent.py",
+                Path(os.getcwd()) / "screen-translator" / "hook_agent.py",
+            ]
+            for c in candidates:
+                if c.exists():
+                    return str(c)
+        except Exception:
+            pass
+        return None
+
     def request_learn(self, *_args) -> None:
         return
 
@@ -220,6 +386,109 @@ class HookTextThread(QThread):
         self._seen_set.add(h)
         return True
 
+    def _packet_seen_add(self, h: int) -> bool:
+        if h in self._packet_seen_set:
+            return False
+        if len(self._packet_seen) >= int(self._packet_seen.maxlen or 0):
+            try:
+                old = self._packet_seen.popleft()
+                try:
+                    self._packet_seen_set.discard(int(old))
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        self._packet_seen.append(h)
+        self._packet_seen_set.add(h)
+        return True
+
+    @staticmethod
+    def _coerce_int(value) -> int | None:
+        try:
+            if value is None:
+                return None
+            s = str(value).strip()
+            if not s:
+                return None
+            return int(s)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_hook_text(text: str) -> str:
+        try:
+            payload = str(text or "")
+        except Exception:
+            return ""
+        if not payload:
+            return ""
+        payload = payload.replace("\x00", "")
+        payload = payload.replace("\r\n", "\n").replace("\r", "\n")
+        payload = re.sub(r"[\x01-\x08\x0b\x0c\x0e-\x1f]", "", payload)
+        payload = re.sub(r"\s+", " ", payload).strip()
+        return payload
+
+    def _build_text_packet(
+        self,
+        text: str,
+        source: str,
+        *,
+        label: str = "",
+        thread_id: int | None = None,
+        pid: int | None = None,
+        transport: str = "",
+    ) -> dict[str, object] | None:
+        payload = self._normalize_hook_text(text)
+        if not payload:
+            return None
+        if len(payload) > int(self._max_chars):
+            payload = payload[: int(self._max_chars)]
+        src = str(source or "unknown").strip().lower() or "unknown"
+        lbl = str(label or src or "unknown").strip() or src
+        tid = self._coerce_int(thread_id)
+        pid_i = self._coerce_int(pid)
+        packet: dict[str, object] = {
+            "text": payload,
+            "source": src,
+            "label": lbl,
+            "thread_id": tid,
+            "pid": pid_i,
+            "signature": f"{src}|{lbl}|{tid if tid is not None else 0}",
+        }
+        if transport:
+            packet["transport"] = str(transport).strip().lower()
+        return packet
+
+    def _should_emit_packet(self, packet: dict[str, object]) -> bool:
+        src = str(packet.get("source") or "")
+        lbl = str(packet.get("label") or "")
+        tid = int(packet.get("thread_id") or 0)
+        txt = str(packet.get("text") or "")
+        key = (src, lbl, tid, txt)
+        now = float(time.time())
+        try:
+            last = float(self._packet_last_emit_ts.get(key, 0.0) or 0.0)
+        except Exception:
+            last = 0.0
+        if last > 0.0 and (now - last) < 0.45:
+            return False
+        self._packet_last_emit_ts[key] = now
+        try:
+            if len(self._packet_last_emit_ts) > 2048:
+                cutoff = now - 20.0
+                stale = [k for k, v in self._packet_last_emit_ts.items() if float(v or 0.0) < cutoff]
+                for k in stale:
+                    self._packet_last_emit_ts.pop(k, None)
+                while len(self._packet_last_emit_ts) > 1536:
+                    try:
+                        first_key = next(iter(self._packet_last_emit_ts))
+                    except Exception:
+                        break
+                    self._packet_last_emit_ts.pop(first_key, None)
+        except Exception:
+            pass
+        return True
+
     def _should_emit(self, text: str) -> bool:
         now = time.time()
         if text == self._last_text and (now - self._last_emit_ts) * 1000.0 < self._debounce_ms:
@@ -229,78 +498,123 @@ class HookTextThread(QThread):
         h = hash(text)
         return self._seen_add(h)
 
-    def _emit_text(self, text: str) -> None:
+    def _emit_text(self, text: str) -> bool:
         payload = str(text or "").strip()
         if not payload:
-            return
+            return False
         # if len(payload) < int(self._min_chars):
         #    return
         if len(payload) > int(self._max_chars):
             payload = payload[: int(self._max_chars)]
         if not self._should_emit(payload):
-            return
+            return False
         try:
             self.text_received.emit(payload)
+            return True
         except Exception:
+            return False
+
+    def _emit_text_with_source(
+        self,
+        text: str,
+        source: str,
+        *,
+        label: str = "",
+        thread_id: int | None = None,
+        pid: int | None = None,
+        transport: str = "",
+    ) -> None:
+        packet = self._build_text_packet(
+            text,
+            source,
+            label=label,
+            thread_id=thread_id,
+            pid=pid,
+            transport=transport,
+        )
+        if packet is None:
             return
-
-    def _emit_text_with_source(self, text: str, source: str) -> None:
         try:
-            payload = str(text or "").strip()
-            if not payload:
-                return
-            if self._prefer_frida_only and source in ("uia", "win_event"):
+            if self._prefer_frida_only and str(packet.get("source") or "") in ("uia", "win_event"):
                 return
         except Exception:
             pass
+        if not self._should_emit_packet(packet):
+            return
         try:
-            hook_log(f"TEXT_SRC: {source}")
+            self.packet_received.emit(dict(packet))
         except Exception:
             pass
-        self._emit_text(payload)
+        try:
+            self._emit_text(str(packet.get("text") or ""))
+        except Exception:
+            pass
+        try:
+            ll = str(packet.get("label") or "").strip().lower()
+            if ll.startswith("pythonapi:pystring_fromstring") or ll.startswith("multibytetowidechar"):
+                return
+            hook_log(
+                "TEXT_SRC: "
+                f"{packet.get('source')} label={packet.get('label')} tid={packet.get('thread_id')}"
+            )
+        except Exception:
+            pass
 
-    def _parse_hook_line(self, line: str) -> tuple[int | None, str, str]:
+    def _parse_hook_line(self, line: str) -> dict[str, object]:
+        result: dict[str, object] = {
+            "pid": None,
+            "text": "",
+            "status": "",
+            "label": "",
+            "source": "",
+            "thread_id": None,
+        }
         payload = str(line or "").strip()
         if not payload:
-            return None, "", ""
+            return result
+        if payload.startswith("[HOOK_ERR]"):
+            err = payload[len("[HOOK_ERR]") :].strip()
+            err = err.replace("\\r", "").replace("\\n", " | ").strip()
+            result["status"] = f"Hook Ren'Py runtime error: {err}" if err else "Hook Ren'Py runtime error"
+            return result
         if payload.startswith("{") and payload.endswith("}"):
             try:
                 import json
 
                 data = json.loads(payload)
-                text = str(data.get("text") or "").strip()
+                text = self._normalize_hook_text(data.get("text") or "")
                 status = str(data.get("status") or "").strip()
                 label = str(data.get("label") or "").strip()
+                source = str(data.get("source") or "").strip().lower()
                 pid = data.get("pid", None)
-                try:
-                    pid = int(pid) if pid is not None else None
-                except Exception:
-                    pid = None
-                
-                # Prepend label to text if present, to show source
-                # if text and label and label != "unknown":
-                #    text = f"[{label}] {text}"
-                    
-                return pid, text, status
+                thread_id = data.get("threadId", data.get("thread_id"))
+                result.update(
+                    {
+                        "pid": self._coerce_int(pid),
+                        "text": text,
+                        "status": status,
+                        "label": label,
+                        "source": source,
+                        "thread_id": self._coerce_int(thread_id),
+                    }
+                )
+                return result
             except Exception:
                 pass
         if payload.lower().startswith("pid=") and "|" in payload:
             head, body = payload.split("|", 1)
             pid_str = head.split("=", 1)[-1].strip()
-            try:
-                pid = int(pid_str)
-            except Exception:
-                pid = None
-            return pid, body.strip(), ""
+            result["pid"] = self._coerce_int(pid_str)
+            result["text"] = self._normalize_hook_text(body)
+            return result
         if payload.lower().startswith("pid:") and "|" in payload:
             head, body = payload.split("|", 1)
             pid_str = head.split(":", 1)[-1].strip()
-            try:
-                pid = int(pid_str)
-            except Exception:
-                pid = None
-            return pid, body.strip(), ""
-        return None, payload, ""
+            result["pid"] = self._coerce_int(pid_str)
+            result["text"] = self._normalize_hook_text(body)
+            return result
+        result["text"] = self._normalize_hook_text(payload)
+        return result
 
     def _server_loop(self) -> None:
         try:
@@ -367,7 +681,13 @@ class HookTextThread(QThread):
                             s = ""
                         if not s:
                             continue
-                        pid, text, status = self._parse_hook_line(s)
+                        packet = self._parse_hook_line(s)
+                        pid = self._coerce_int(packet.get("pid"))
+                        text = str(packet.get("text") or "")
+                        status = str(packet.get("status") or "")
+                        label = str(packet.get("label") or "").strip()
+                        source = str(packet.get("source") or "").strip().lower() or "socket"
+                        thread_id = self._coerce_int(packet.get("thread_id"))
                         if pid is not None and int(pid) != int(self._pid):
                             continue
                         if status:
@@ -379,7 +699,14 @@ class HookTextThread(QThread):
                                 hook_log(f"STATUS(EXT): {status}")
                             except Exception:
                                 pass
-                        self._emit_text_with_source(text, "socket")
+                        self._emit_text_with_source(
+                            text,
+                            source,
+                            label=label,
+                            thread_id=thread_id,
+                            pid=pid,
+                            transport="socket",
+                        )
             finally:
                 try:
                     conn.close()
@@ -547,11 +874,17 @@ class HookTextThread(QThread):
 
         out_port = int(self._listen_port or 37123)
         out_host = "127.0.0.1"
+        try:
+            mode = "ENABLED" if bool(self._enable_renpy_injection) else "DISABLED"
+            self.status.emit(f"Hook Ren'Py injection mode: {mode}")
+        except Exception:
+            pass
 
         script_src = r"""
         const MAX_LEN = 500;
         const HOOK_HOST = "__HOOK_HOST__";
         const HOOK_PORT = __HOOK_PORT__;
+        const ENABLE_RENPY_INJECTION = (__ENABLE_RENPY_INJECTION__ === 1);
         
         // Helper to find exports robustly
         function findExport(lib, name) {
@@ -601,7 +934,8 @@ class HookTextThread(QThread):
           send({ status: "debug_env: Interceptor=" + typeof Interceptor + 
                  ", NativeFunction=" + typeof NativeFunction + 
                  ", Module=" + typeof Module +
-                 ", Memory=" + typeof Memory });
+                 ", Memory=" + typeof Memory +
+                 ", File=" + typeof File });
         } catch(e) {
           send({ status: "debug_env_fail: " + e });
         }
@@ -674,14 +1008,18 @@ class HookTextThread(QThread):
 
         var _lastText = "";
         var _lastTime = 0;
+        // Once Ren'Py injection succeeds, prefer injected Ren'Py socket text only.
+        // This avoids PythonAPI/SDL/GDI noise flood on DDLC-like games.
+        var _renpyTextOnly = false;
         
         // --- Rate Limiting & Safety ---
         var _globalMsgCount = 0;
         var _globalMsgTimer = 0;
         var _glyphDebugCount = 0; // Dedicated counter for glyph index debug sampling
-        const MAX_MSG_PER_SEC = 20; // Max messages per second
+        const MAX_MSG_PER_SEC = 120; // Keep up with fast VN text without dropping current lines
         var _startTime = Date.now();
         const STARTUP_DELAY_MS = 1000; // Wait 1s before sending text to avoid startup freeze
+        const TYPEWRITER_SETTLE_MS = 120;
 
         // Universal Typewriter Buffer
         var _uCharBuf = "";
@@ -718,8 +1056,32 @@ class HookTextThread(QThread):
             } catch(e) { return (s || "").toString(); }
         }
 
+        function looksCompleteSentence(t, trimmed) {
+            try {
+                t = (t || "").toString();
+                trimmed = (trimmed || "").toString();
+                if (!t) return false;
+                if (/[.!?\u3002\uff01\uff1f\u2026\u300d\u300f"']$/.test(trimmed)) return true;
+                if (/[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]/.test(t)) return true;
+                if (t.indexOf(" ") !== -1) return true;
+                if (t.length >= 12) return true;
+            } catch(e) {}
+            return false;
+        }
+
+        function shouldSendImmediately(t, trimmed) {
+            try {
+                t = (t || "").toString();
+                trimmed = (trimmed || "").toString();
+                if (!t || !trimmed) return false;
+                if (t.length >= 2) return true;
+            } catch(e) {}
+            return false;
+        }
+
         function sendText(t, label) {
             try {
+                if (_renpyTextOnly) return;
                 // Startup Delay
                 if (Date.now() - _startTime < STARTUP_DELAY_MS) return;
                 
@@ -746,7 +1108,7 @@ class HookTextThread(QThread):
                                 sendTextInternal(_growBuf, _growLabel);
                                 _growSent = true;
                             }
-                        }, 300);
+                        }, TYPEWRITER_SETTLE_MS);
                         return;
                     }
                 }
@@ -788,7 +1150,11 @@ class HookTextThread(QThread):
                             _growBuf = t;
                             _growLabel = label || _growLabel;
                             _growSent = false; // Mark as unsent since it grew
-                            
+
+                            if (shouldSendImmediately(_growBuf, _growBuf.trim())) {
+                                sendTextInternal(_growBuf, _growLabel);
+                                _growSent = true;
+                            }
                             if (_growTimer) clearTimeout(_growTimer);
                             _growTimer = setTimeout(function() {
                                 if (_growBuf && !_growSent) {
@@ -796,7 +1162,7 @@ class HookTextThread(QThread):
                                     _growSent = true;
                                     // We keep _growBuf to prevent re-sending if game keeps redrawing it
                                 }
-                            }, 300); // 300ms pause = end of sentence
+                            }, TYPEWRITER_SETTLE_MS); // short settle window for typewriter growth
                             return;
                         }
                     }
@@ -817,7 +1183,7 @@ class HookTextThread(QThread):
                             sendTextInternal(_uCharBuf, _uCharLabel);
                             _uCharBuf = "";
                         }
-                    }, 300);
+                    }, TYPEWRITER_SETTLE_MS);
                     return;
                 }
                 
@@ -840,13 +1206,17 @@ class HookTextThread(QThread):
                     _growBuf = joined;
                     _growLabel = label || _uCharLabel || _growLabel;
                     _growSent = false;
+                    if (shouldSendImmediately(_growBuf, _growBuf.trim())) {
+                        sendTextInternal(_growBuf, _growLabel);
+                        _growSent = true;
+                    }
                     if (_growTimer) clearTimeout(_growTimer);
                     _growTimer = setTimeout(function() {
                         if (_growBuf && !_growSent) {
                             sendTextInternal(_growBuf, _growLabel);
                             _growSent = true;
                         }
-                    }, 300);
+                    }, TYPEWRITER_SETTLE_MS);
                     return;
                 } else if (_uNorm) {
                     // Flush single char buffer if not superseded
@@ -859,20 +1229,28 @@ class HookTextThread(QThread):
                 _growBuf = t;
                 _growLabel = label;
                 _growSent = false;
-                
+
+                if (shouldSendImmediately(t, trimmed)) {
+                    sendTextInternal(_growBuf, _growLabel);
+                    _growSent = true;
+                    if (_growTimer) clearTimeout(_growTimer);
+                    _growTimer = null;
+                }
+
                 if (_growTimer) clearTimeout(_growTimer);
                 _growTimer = setTimeout(function() {
                     if (_growBuf && !_growSent) {
                         sendTextInternal(_growBuf, _growLabel);
                         _growSent = true;
                     }
-                }, 300);
+                }, TYPEWRITER_SETTLE_MS);
                 
             } catch(e) {}
         }
 
         function sendTextInternal(t, label) {
              try {
+                if (_renpyTextOnly) return;
                 // Global Dedup for Shadow Rendering (same string sent twice within 200ms)
                 var now = Date.now();
                 if (t === _lastText && (now - _lastTime) < 200) {
@@ -915,14 +1293,20 @@ class HookTextThread(QThread):
                 if (BAD_STRINGS[t]) return;
                 
                 // Substring Blacklist for UI Noise
+                var tl = t.toLowerCase();
                 var BAD_SUBSTRINGS = [
-                    "Test 1:", "Test 2:", "Test 3:", "Test 4:", "Test 5:", 
-                    "PID:", "Run ScreenTranslator", "Select this window", "Click buttons below",
-                    "Ready...", "GetTextExtentPoint32W",
-                    "Running Typewriter", "Typewriter Done"
+                    "test 1:", "test 2:", "test 3:", "test 4:", "test 5:", 
+                    "pid:", "run screentranslator", "select this window", "click buttons below",
+                    "ready...", "gettextextentpoint32w",
+                    "running typewriter", "typewriter done",
+                    "must be unicode", "expected a character buffer object",
+                    "string index out of range", "bytearray index out of range",
+                    "window was restored", "primary display bounds",
+                    "windowed mode", "screen sizes:", "persistent.",
+                    "main_menu", "py_repr"
                 ];
                 for (var i = 0; i < BAD_SUBSTRINGS.length; i++) {
-                    if (t.indexOf(BAD_SUBSTRINGS[i]) !== -1) return;
+                    if (tl.indexOf(BAD_SUBSTRINGS[i]) !== -1) return;
                 }
 
                 if (t.endsWith("$")) return;
@@ -930,6 +1314,8 @@ class HookTextThread(QThread):
                 if (t.startsWith("%")) return;
                 if (t.startsWith("<") && t.endsWith(">")) return;
                 if (t.startsWith("[") && t.endsWith("]")) return;
+                if (/^\d+\s*[-_/.:]\s*\d+$/.test(t)) return;
+                if (/^[\{\}\[\]\(\)<>\-_=+*\/\\|~`!@#$%^&:;,.?\d\s]+$/.test(t)) return;
                 
                 // Block raw function names from being sent as text content if they slip through
                 if (t === "GetTextExtentPoint32W" || t === "GetTextExtentExPointW" || t === "TextOutW" || t === "ExtTextOutW") return;
@@ -953,7 +1339,7 @@ class HookTextThread(QThread):
 
                 const tid = Process.getCurrentThreadId();
                 _globalMsgCount++;
-                send({ text: t, threadId: tid, label: label || "unknown" });
+                send({ text: t, threadId: tid, label: label || "unknown", source: "frida" });
             } catch(e) {}
         }
         function hookGdi(name, lib, handler) {
@@ -1022,21 +1408,204 @@ class HookTextThread(QThread):
           } catch (e) {}
         }
         function tryInjectRenpy() {
-          const pyrun = findSymbolAny("PyRun_SimpleStringFlags") || findSymbolAny("PyRun_SimpleString");
-          if (!pyrun) {
+          const pyrunSimple = findSymbolAny("PyRun_SimpleString");
+          const pyrunString = findSymbolAny("PyRun_StringFlags") || findSymbolAny("PyRun_String");
+          const pyrunFlags = pyrunSimple ? null : findSymbolAny("PyRun_SimpleStringFlags");
+          const pImportAddModule = findSymbolAny("PyImport_AddModule");
+          const pModuleGetDict = findSymbolAny("PyModule_GetDict");
+          if (!pyrunSimple && !pyrunFlags && !pyrunString) {
             // send({ status: "renpy_no_pyrun" });
             return false;
           }
           const ensure = findSymbolAny("PyGILState_Ensure");
           const release = findSymbolAny("PyGILState_Release");
           const initThreads = findSymbolAny("PyEval_InitThreads");
-          const PyRun = new NativeFunction(pyrun, "int", ["pointer"]);
+          let PyRunFlags = null;
+          let PyRunSimple = null;
+          let PyRunStringFlags = null;
+          let pyFlagsPtr = ptr(0);
+          try {
+            if (pyrunFlags) {
+              PyRunFlags = new NativeFunction(pyrunFlags, "int", ["pointer", "pointer"]);
+              pyFlagsPtr = Memory.alloc(16);
+              Memory.writeU32(pyFlagsPtr, 0);
+            }
+          } catch (e) {
+            send({ status: "renpy_pyrun_ctor_failed", error: "flags: " + e });
+          }
+          try {
+            if (pyrunSimple) PyRunSimple = new NativeFunction(pyrunSimple, "int", ["pointer"]);
+          } catch (e) {
+            send({ status: "renpy_pyrun_ctor_failed", error: "simple: " + e });
+          }
+          try {
+            if (pyrunString) PyRunStringFlags = new NativeFunction(pyrunString, "pointer", ["pointer", "int", "pointer", "pointer", "pointer"]);
+          } catch (e) {
+            send({ status: "renpy_pyrun_ctor_failed", error: "string: " + e });
+          }
+          const PyImport_AddModule = pImportAddModule ? new NativeFunction(pImportAddModule, "pointer", ["pointer"]) : null;
+          const PyModule_GetDict = pModuleGetDict ? new NativeFunction(pModuleGetDict, "pointer", ["pointer"]) : null;
+          if (!PyRunFlags && !PyRunSimple && !PyRunStringFlags) {
+            return false;
+          }
           const PyGIL_Ensure = ensure ? new NativeFunction(ensure, "int", []) : null;
           const PyGIL_Release = release ? new NativeFunction(release, "void", ["int"]) : null;
           const PyEval_InitThreads = initThreads ? new NativeFunction(initThreads, "void", []) : null;
+          const pPyErrOccurred = findSymbolAny("PyErr_Occurred");
+          const pPyErrFetch = findSymbolAny("PyErr_Fetch");
+          const pPyErrNormalize = findSymbolAny("PyErr_NormalizeException");
+          const pPyObjectStr = findSymbolAny("PyObject_Str");
+          const pPyObjectRepr = findSymbolAny("PyObject_Repr");
+          const pPyStringAsString = findSymbolAny("PyString_AsString");
+          const pPyUnicodeAsUTF8String = findSymbolAny("PyUnicodeUCS2_AsUTF8String") || findSymbolAny("PyUnicode_AsUTF8String");
+          const pPyDecRef = findSymbolAny("Py_DecRef");
+          const pPyEvalGetBuiltins = findSymbolAny("PyEval_GetBuiltins");
+          const pPyDictSetItemString = findSymbolAny("PyDict_SetItemString");
+          const PyErr_Occurred = pPyErrOccurred ? new NativeFunction(pPyErrOccurred, "pointer", []) : null;
+          const PyErr_Fetch = pPyErrFetch ? new NativeFunction(pPyErrFetch, "void", ["pointer", "pointer", "pointer"]) : null;
+          const PyErr_NormalizeException = pPyErrNormalize ? new NativeFunction(pPyErrNormalize, "void", ["pointer", "pointer", "pointer"]) : null;
+          const PyObject_Str = pPyObjectStr ? new NativeFunction(pPyObjectStr, "pointer", ["pointer"]) : null;
+          const PyObject_Repr = pPyObjectRepr ? new NativeFunction(pPyObjectRepr, "pointer", ["pointer"]) : null;
+          const PyString_AsString = pPyStringAsString ? new NativeFunction(pPyStringAsString, "pointer", ["pointer"]) : null;
+          const PyUnicode_AsUTF8String = pPyUnicodeAsUTF8String ? new NativeFunction(pPyUnicodeAsUTF8String, "pointer", ["pointer"]) : null;
+          const Py_DecRef = pPyDecRef ? new NativeFunction(pPyDecRef, "void", ["pointer"]) : null;
+          const PyEval_GetBuiltins = pPyEvalGetBuiltins ? new NativeFunction(pPyEvalGetBuiltins, "pointer", []) : null;
+          const PyDict_SetItemString = pPyDictSetItemString ? new NativeFunction(pPyDictSetItemString, "int", ["pointer", "pointer", "pointer"]) : null;
           send({ status: "renpy_pyrun_found" });
+          function pyObjToUtf8(obj) {
+            if (!obj || obj.isNull()) return "";
+            function readStringObj(strObj) {
+              if (!strObj || strObj.isNull() || !PyString_AsString) return "";
+              try {
+                const p = PyString_AsString(strObj);
+                if (p && !p.isNull()) return readA(p, MAX_LEN);
+              } catch (e) {}
+              return "";
+            }
+            let tmp = ptr(0);
+            try {
+              let direct = readStringObj(obj);
+              if (direct) return direct;
+              if (PyUnicode_AsUTF8String) {
+                try {
+                  tmp = PyUnicode_AsUTF8String(obj);
+                  const text = readStringObj(tmp);
+                  if (text) return text;
+                } catch (e) {}
+                if (tmp && !tmp.isNull() && Py_DecRef) {
+                  try { Py_DecRef(tmp); } catch (e) {}
+                }
+                tmp = ptr(0);
+              }
+              if (PyObject_Str) {
+                try {
+                  tmp = PyObject_Str(obj);
+                  const text = readStringObj(tmp);
+                  if (text) return text;
+                } catch (e) {}
+                if (tmp && !tmp.isNull() && Py_DecRef) {
+                  try { Py_DecRef(tmp); } catch (e) {}
+                }
+                tmp = ptr(0);
+              }
+              if (PyObject_Repr) {
+                try {
+                  tmp = PyObject_Repr(obj);
+                  const text = readStringObj(tmp);
+                  if (text) return text;
+                } catch (e) {}
+              }
+            } catch (e) {}
+            finally {
+              if (tmp && !tmp.isNull() && Py_DecRef) {
+                try { Py_DecRef(tmp); } catch (e) {}
+              }
+            }
+            return "";
+          }
+          function readPyErrorDetail() {
+            try {
+              if (!PyErr_Occurred || !PyErr_Fetch) return "";
+              const current = PyErr_Occurred();
+              if (!current || current.isNull()) return "";
+              const ptype = Memory.alloc(Process.pointerSize);
+              const pvalue = Memory.alloc(Process.pointerSize);
+              const ptb = Memory.alloc(Process.pointerSize);
+              Memory.writePointer(ptype, ptr(0));
+              Memory.writePointer(pvalue, ptr(0));
+              Memory.writePointer(ptb, ptr(0));
+              PyErr_Fetch(ptype, pvalue, ptb);
+              if (PyErr_NormalizeException) {
+                try { PyErr_NormalizeException(ptype, pvalue, ptb); } catch (e) {}
+              }
+              const typeObj = Memory.readPointer(ptype);
+              const valueObj = Memory.readPointer(pvalue);
+              const tbObj = Memory.readPointer(ptb);
+              const parts = [];
+              const typeText = pyObjToUtf8(typeObj);
+              const valueText = pyObjToUtf8(valueObj);
+              if (typeText) parts.push(typeText);
+              if (valueText && valueText !== typeText) parts.push(valueText);
+              [typeObj, valueObj, tbObj].forEach(function (obj) {
+                if (obj && !obj.isNull() && Py_DecRef) {
+                  try { Py_DecRef(obj); } catch (e) {}
+                }
+              });
+              return parts.join(": ");
+            } catch (e) {
+              return "";
+            }
+          }
+          function getMainDict() {
+            try {
+              if (!PyImport_AddModule || !PyModule_GetDict) return ptr(0);
+              const mainName = Memory.allocUtf8String("__main__");
+              const mod = PyImport_AddModule(mainName);
+              if (!mod || mod.isNull()) return ptr(0);
+              const d = PyModule_GetDict(mod);
+              if (!d || d.isNull()) return ptr(0);
+              if (PyEval_GetBuiltins && PyDict_SetItemString) {
+                try {
+                  const builtinsDict = PyEval_GetBuiltins();
+                  if (builtinsDict && !builtinsDict.isNull()) {
+                    const builtinsName = Memory.allocUtf8String("__builtins__");
+                    PyDict_SetItemString(d, builtinsName, builtinsDict);
+                  }
+                } catch (e) {}
+              }
+              return d;
+            } catch (e) {
+              return ptr(0);
+            }
+          }
+          function runPyCode(codePtr) {
+            if (PyRunSimple) {
+              try {
+                return PyRunSimple(codePtr) === 0;
+              } catch (e) {}
+            }
+            if (PyRunFlags) {
+              try {
+                return PyRunFlags(codePtr, pyFlagsPtr) === 0;
+              } catch (e) {}
+            }
+            if (PyRunStringFlags) {
+              try {
+                const mainDict = getMainDict();
+                if (mainDict && !mainDict.isNull()) {
+                  const result = PyRunStringFlags(codePtr, 257, mainDict, mainDict, pyFlagsPtr);
+                  if (!result || result.isNull()) return false;
+                  if (Py_DecRef) {
+                    try { Py_DecRef(result); } catch (e) {}
+                  }
+                  return true;
+                }
+              } catch (e) {}
+            }
+            return false;
+          }
           const codeLines = [
-            "import threading, time, socket, re",
+            "import threading, time, socket, re, json",
             "BAD_STRINGS = {",
             "    'voice', 'movie', 'overlay', 'transient', 'None', 'master',",
             "    'splash_message', 'transform', 'image_placement', 'default',",
@@ -1069,12 +1638,128 @@ class HookTextThread(QThread):
             "    'size_group', 'events', 'trans', 'show', 'hide', 'scene',",
             "    'config', 'store', 'persistent', 'name', 'screen'",
             "}",
-            "def _st_send(t):",
+            "try:",
+            "    _st_text_type = unicode",
+            "    _st_basestring = basestring",
+            "except NameError:",
+            "    _st_text_type = str",
+            "    _st_basestring = str",
+            "_st_last = ''",
+            "_st_last_ts = 0.0",
+            "_st_last_live_ts = 0.0",
+            "_st_live_source_seen = False",
+            "def _st_to_text(v, depth=0):",
+            "    try:",
+            "        if depth > 5:",
+            "            return ''",
+            "        if v is None:",
+            "            return ''",
+            "        if isinstance(v, _st_text_type):",
+            "            return v",
+            "        if isinstance(v, _st_basestring):",
+            "            try:",
+            "                return v.decode('utf-8', 'ignore')",
+            "            except Exception:",
+            "                try: return _st_text_type(v)",
+            "                except Exception: return ''",
+            "        if isinstance(v, (list, tuple)):",
+            "            out = []",
+            "            for it in v:",
+            "                s = _st_to_text(it, depth + 1)",
+            "                if s: out.append(s)",
+            "            return u' '.join(out)",
+            "        if isinstance(v, dict):",
+            "            out = []",
+            "            for k in ('what', 'text', 'say', 'content', 'value'):",
+            "                if k in v:",
+            "                    s = _st_to_text(v.get(k), depth + 1)",
+            "                    if s: out.append(s)",
+            "            if out: return u' '.join(out)",
+            "        for attr in ('what', 'text', 'string', 'contents', 'content'):",
+            "            try:",
+            "                if hasattr(v, attr):",
+            "                    s = _st_to_text(getattr(v, attr), depth + 1)",
+            "                    if s: return s",
+            "            except Exception:",
+            "                pass",
+            "        try:",
+            "            return _st_text_type(v)",
+            "        except Exception:",
+            "            return ''",
+            "    except Exception:",
+            "        return ''",
+            "def _st_clean(s):",
+            "    try:",
+            "        s = _st_to_text(s)",
+            "        if not s:",
+            "            return ''",
+            "        # remove Ren'Py text tags like {w}, {i}... while keeping plain text",
+            "        s = re.sub(r'\\{[^{}]{0,80}\\}', '', s)",
+            "        s = ' '.join(s.splitlines())",
+            "        s = re.sub(r'\\s+', ' ', s).strip()",
+            "        return s",
+            "    except Exception:",
+            "        return ''",
+            "def _st_is_live_label(label):",
+            "    try:",
+            "        ll = _st_text_type(label or '').strip().lower()",
+            "        if not ll: return False",
+            "        if ll.startswith('renpy:patch:say_menu_text_filter'):",
+            "            return False",
+            "        if ll.startswith('renpy:patch:') or ll.startswith('renpy:text:') or ll.startswith('renpy:dtext:') or ll.startswith('renpy:character:'):",
+            "            return True",
+            "        if ll.startswith('renpy:interact:'):",
+            "            return True",
+            "        if ll.startswith('renpy:poll:screen:') or ll.startswith('renpy:poll:last_say_what') or ll.startswith('renpy:poll:last_say'):",
+            "            return True",
+            "        return False",
+            "    except Exception:",
+            "        return False",
+            "def _st_send_raw(msg, label='renpy'):",
+            "    c = None",
+            "    try:",
+            "        if msg is None: return",
+            "        payload = {'text': _st_clean(msg), 'source': 'socket', 'label': (label or 'renpy')}",
+            "        if not payload['text']: return",
+            "        data = (json.dumps(payload, ensure_ascii=False) + '\\n').encode('utf-8', 'ignore')",
+            "        c = socket.socket()",
+            "        c.connect(('__HOOK_HOST__', __HOOK_PORT__))",
+            "        c.send(data)",
+            "    except Exception:",
+            "        pass",
+            "    try:",
+            "        if c is not None: c.close()",
+            "    except Exception:",
+            "        pass",
+            "def _st_send(t, label='renpy'):",
             "    try:",
             "        if t is None: return",
-            "        s = str(t).strip()",
+            "        global _st_last, _st_last_ts, _st_last_live_ts, _st_live_source_seen",
+            "        s = _st_clean(t)",
             "        if not s: return",
-            "        if len(s) < 2: return",
+            "        now_ts = time.time()",
+            "        if s == _st_last and (now_ts - float(_st_last_ts or 0.0)) < 0.65: return",
+            "        ll = _st_text_type(label or 'renpy').strip().lower()",
+            "        if ll.startswith('renpy:patch:say_menu_text_filter'):",
+            "            return",
+            "        if ll.startswith('renpy:poll:history') and _st_live_source_seen:",
+            "            return",
+            "        if len(s) < 2:",
+            "            keep_short = False",
+            "            try:",
+            "                for _ch in s:",
+            "                    _cp = ord(_ch)",
+            "                    if (0x3040 <= _cp <= 0x30FF) or (0x4E00 <= _cp <= 0x9FFF) or (0xAC00 <= _cp <= 0xD7AF):",
+            "                        keep_short = True",
+            "                        break",
+            "            except Exception:",
+            "                keep_short = False",
+            "            if not keep_short: return",
+            "        if s == '[HOOK_READY]':",
+            "            _st_last = s",
+            "            _st_last_ts = now_ts",
+            "            _st_send_raw(s, label or 'renpy:ready')",
+            "            return",
             "        if s in BAD_STRINGS: return",
             "        if s.startswith('_'): return",
             "        if s.startswith('<') and s.endswith('>'): return",
@@ -1082,43 +1767,216 @@ class HookTextThread(QThread):
             "        if s.startswith('{') and s.endswith('}'): return",
             "        if s.endswith('$'): return",
             "        if s.startswith('%'): return",
+            "        low = s.lower()",
+            "        if 'must be unicode, not str' in low: return",
+            "        if 'expected a character buffer object' in low: return",
+            "        if 'string index out of range' in low: return",
+            "        if 'argument 1 must be unicode, not str' in low: return",
+            "        if re.match(r'^\\d+\\s*[-_/.:]\\s*\\d+$', s): return",
+            "        if re.match(r'^[\\{\\}\\[\\]\\(\\)<>\\-_=+*/\\\\|~`!@#$%^&:;,.?\\d\\s]+$', s):",
+            "            if not ll.startswith('renpy:patch:') and not ll.startswith('renpy:interact:') and not ll.startswith('renpy:poll:'):",
+            "                return",
+            "            if len(s) <= 2:",
+            "                return",
             "        # Ignore snake_case variables (lowercase start, alphanumeric+underscore)",
             "        if re.match(r'^[a-z][a-z0-9_]*$', s): return",
             "        # Ignore path-like strings",
             "        if '/' in s or '\\\\' in s:",
             "             if '.rpy' in s or '.png' in s or '.jpg' in s or '.ogg' in s: return",
-            "        c = socket.socket()",
-            "        c.connect(('__HOOK_HOST__', __HOOK_PORT__))",
-            "        c.send((s + '\\n').encode('utf-8', 'ignore'))",
-            "        c.close()",
+            "        if not _st_is_dialogue_like(s):",
+            "            if not _st_is_live_label(ll):",
+            "                return",
+            "            if len(s) > 220:",
+            "                return",
+            "        if _st_is_live_label(ll):",
+            "            _st_live_source_seen = True",
+            "            _st_last_live_ts = time.time()",
+            "        _st_last = s",
+            "        _st_last_ts = now_ts",
+            "        _st_send_raw(s, label)",
             "    except Exception:",
             "        pass",
+            "def _st_is_dialogue_like(s):",
+            "    try:",
+            "        if not s: return False",
+            "        if len(s) < 2: return False",
+            "        low = s.lower()",
+            "        bad_sub = [",
+            "            '.png', '.jpg', '.ogg', '.rpy', '.rpa', 'persistent.', 'menu_', 'screen ',",
+            "            'transform', 'viewport', 'imagemap', 'dissolve(', 'return ', 'python:', 'label '",
+            "        ]",
+            "        for b in bad_sub:",
+            "            if b in low: return False",
+            "        if low.startswith('c:') or low.startswith('pk'):",
+            "            return False",
+            "        # too code-like",
+            "        sym = 0",
+            "        tot = 0",
+            "        for ch in s:",
+            "            if ch.isspace():",
+            "                continue",
+            "            tot += 1",
+            "            if ch in '{}[]()<>|\\\\/*=:+`~$%^&_#@':",
+            "                sym += 1",
+            "        if tot > 0 and (float(sym) / float(tot)) > 0.35:",
+            "            return False",
+            "        return True",
+            "    except Exception:",
+            "        return False",
+            "def _st_get_screen_what(prefix):",
+            "    try:",
+            "        import renpy",
+            "    except Exception:",
+            "        return '', ''",
+            "    try:",
+            "        gv = getattr(renpy, 'get_screen_variable', None)",
+            "        if not gv:",
+            "            ex = getattr(renpy, 'exports', None)",
+            "            gv = getattr(ex, 'get_screen_variable', None) if ex is not None else None",
+            "        if not gv:",
+            "            return '', ''",
+            "        for screen_name in ('say', 'nvl', 'bubble'):",
+            "            try:",
+            "                v = gv('what', screen=screen_name)",
+            "                s = _st_clean(v)",
+            "                if s:",
+            "                    return s, (prefix + ':' + screen_name)",
+            "            except Exception:",
+            "                pass",
+            "    except Exception:",
+            "        pass",
+            "    return '', ''",
+            "def _st_poll_dialog(rev):",
+            "    while True:",
+            "        try:",
+            "            try:",
+            "                import renpy",
+            "                if getattr(renpy, '_st_poll_rev', 0) != rev:",
+            "                    return",
+            "            except Exception:",
+            "                pass",
+            "            try:",
+            "                if _st_live_source_seen and (time.time() - float(_st_last_live_ts or 0.0)) < 1.25:",
+            "                    time.sleep(0.08)",
+            "                    continue",
+            "            except Exception:",
+            "                pass",
+            "            t = ''",
+            "            label = 'renpy:poll'",
+            "            try:",
+            "                t, label = _st_get_screen_what('renpy:poll:screen')",
+            "            except Exception:",
+            "                t, label = '', 'renpy:poll'",
+            "            try:",
+            "                if not t:",
+            "                    import renpy",
+            "                    t = renpy.exports.last_say_what() or ''",
+            "                    if t: label = 'renpy:poll:last_say_what'",
+            "            except Exception:",
+            "                t = ''",
+            "            if not t:",
+            "                try:",
+            "                    import renpy",
+            "                    ls = renpy.exports.last_say()",
+            "                    if isinstance(ls, (list, tuple)) and len(ls) >= 2:",
+            "                        t = ls[1] or ''",
+            "                        if t: label = 'renpy:poll:last_say'",
+            "                except Exception:",
+            "                    t = ''",
+            "            if not t:",
+            "                try:",
+            "                    import renpy",
+            "                    h = getattr(renpy.store, '_history_list', None)",
+            "                    if h and len(h) > 0:",
+            "                        for x in reversed(h):",
+            "                            k = _st_text_type(getattr(x, 'kind', '') or '').lower()",
+            "                            if k != 'current':",
+            "                                continue",
+            "                            t = getattr(x, 'what', '') or ''",
+            "                            if t:",
+            "                                label = 'renpy:poll:history_current'",
+            "                                break",
+            "                except Exception:",
+            "                    t = ''",
+            "            if t:",
+            "                _st_send(t, label)",
+            "        except Exception:",
+            "            pass",
+            "        time.sleep(0.08)",
             "def _st_patch():",
             "    try:",
             "        import renpy",
             "    except Exception:",
             "        return False",
             "    try:",
-            "        if getattr(renpy, '_st_patched', False):",
+            "        if getattr(renpy, '_st_patch_rev', 0) >= 10:",
             "            return True",
-            "        renpy._st_patched = True",
             "    except Exception:",
             "        pass",
             "    ok = False",
             "    try:",
             "        old_say = renpy.exports.say",
-            "        def say(who, what, *args, **kwargs):",
-            "            try: _st_send(what)",
+            "        def say(*args, **kwargs):",
+            "            try:",
+            "                _w = kwargs.get('what', None)",
+            "                if _w is None and len(args) >= 2: _w = args[1]",
+            "                if _w is None and len(args) >= 1: _w = args[-1]",
+            "                _st_send(_w, 'renpy:patch:say')",
             "            except Exception: pass",
-            "            return old_say(who, what, *args, **kwargs)",
+            "            return old_say(*args, **kwargs)",
             "        renpy.exports.say = say",
             "        ok = True",
             "    except Exception:",
             "        pass",
             "    try:",
+            "        old_ds = getattr(renpy.exports, 'display_say', None)",
+            "        if old_ds:",
+            "            def display_say(*args, **kwargs):",
+            "                try:",
+            "                    _w = kwargs.get('what', None)",
+            "                    if _w is None and len(args) >= 2: _w = args[1]",
+            "                    if _w is None and len(args) >= 1: _w = args[-1]",
+            "                    _st_send(_w, 'renpy:patch:display_say')",
+            "                except Exception: pass",
+            "                return old_ds(*args, **kwargs)",
+            "            renpy.exports.display_say = display_say",
+            "            ok = True",
+            "    except Exception:",
+            "        pass",
+            "    try:",
+            "        old_rpy_ds = getattr(renpy, 'display_say', None)",
+            "        if old_rpy_ds:",
+            "            def rpy_display_say(*args, **kwargs):",
+            "                try:",
+            "                    _w = kwargs.get('what', None)",
+            "                    if _w is None and len(args) >= 2: _w = args[1]",
+            "                    if _w is None and len(args) >= 1: _w = args[-1]",
+            "                    _st_send(_w, 'renpy:patch:renpy_display_say')",
+            "                except Exception: pass",
+            "                return old_rpy_ds(*args, **kwargs)",
+            "            renpy.display_say = rpy_display_say",
+            "            ok = True",
+            "    except Exception:",
+            "        pass",
+            "    try:",
+            "        old_rpy_say = getattr(renpy, 'say', None)",
+            "        if old_rpy_say:",
+            "            def rpy_say(*args, **kwargs):",
+            "                try:",
+            "                    _w = kwargs.get('what', None)",
+            "                    if _w is None and len(args) >= 2: _w = args[1]",
+            "                    if _w is None and len(args) >= 1: _w = args[-1]",
+            "                    _st_send(_w, 'renpy:patch:renpy_say')",
+            "                except Exception: pass",
+            "                return old_rpy_say(*args, **kwargs)",
+            "            renpy.say = rpy_say",
+            "            ok = True",
+            "    except Exception:",
+            "        pass",
+            "    try:",
             "        old_utter = renpy.exports.utter",
             "        def utter(what, *args, **kwargs):",
-            "            try: _st_send(what)",
+            "            try: _st_send(what, 'renpy:patch:utter')",
             "            except Exception: pass",
             "            return old_utter(what, *args, **kwargs)",
             "        renpy.exports.utter = utter",
@@ -1126,10 +1984,15 @@ class HookTextThread(QThread):
             "    except Exception:",
             "        pass",
             "    try:",
+            "        # Keep original filter untouched: this hook is noisy and often out-of-order.",
+            "        _ = getattr(renpy.config, 'say_menu_text_filter', None)",
+            "    except Exception:",
+            "        pass",
+            "    try:",
             "        import renpy.character as _st_char",
             "        old_ccall = _st_char.Character.__call__",
             "        def ccall(self, what, *args, **kwargs):",
-            "            try: _st_send(what)",
+            "            try: _st_send(what, 'renpy:character:call')",
             "            except Exception: pass",
             "            return old_ccall(self, what, *args, **kwargs)",
             "        _st_char.Character.__call__ = ccall",
@@ -1137,22 +2000,31 @@ class HookTextThread(QThread):
             "    except Exception:",
             "        pass",
             "    try:",
-            "        import renpy.display.behavior as _st_beh",
-            "        old_bsay = _st_beh.say",
-            "        def bsay(who, what, *args, **kwargs):",
-            "            try: _st_send(what)",
-            "            except Exception: pass",
-            "            return old_bsay(who, what, *args, **kwargs)",
-            "        _st_beh.say = bsay",
-            "        ok = True",
+            "        import renpy.character as _st_char",
+            "        adv = getattr(_st_char, 'ADVCharacter', None)",
+            "        if adv and hasattr(adv, '__call__'):",
+            "            old_adv_call = adv.__call__",
+            "            def adv_call(self, what, *args, **kwargs):",
+            "                try: _st_send(what, 'renpy:character:adv_call')",
+            "                except Exception: pass",
+            "                return old_adv_call(self, what, *args, **kwargs)",
+            "            adv.__call__ = adv_call",
+            "            ok = True",
             "    except Exception:",
             "        pass",
             "    try:",
             "        import renpy.text.text as _st_text",
             "        old_init = _st_text.Text.__init__",
             "        def tinit(self, text, *args, **kwargs):",
-            "            try: _st_send(text)",
-            "            except Exception: pass",
+            "            try:",
+            "                style = kwargs.get('style', '') if kwargs else ''",
+            "                style_s = _st_text_type(style or '').lower()",
+            "                if ('say_dialogue' in style_s) or ('nvl_dialogue' in style_s) or ('say' == style_s):",
+            "                    s = _st_clean(text)",
+            "                    if _st_is_dialogue_like(s):",
+            "                        _st_send(s, 'renpy:text:init')",
+            "            except Exception:",
+            "                pass",
             "            return old_init(self, text, *args, **kwargs)",
             "        _st_text.Text.__init__ = tinit",
             "        ok = True",
@@ -1160,15 +2032,116 @@ class HookTextThread(QThread):
             "        pass",
             "    try:",
             "        import renpy.text.text as _st_text",
-            "        old_set = _st_text.Text.set_text",
-            "        def tset(self, text, *args, **kwargs):",
-            "            try: _st_send(text)",
-            "            except Exception: pass",
-            "            return old_set(self, text, *args, **kwargs)",
-            "        _st_text.Text.set_text = tset",
-            "        ok = True",
+            "        old_set = getattr(_st_text.Text, 'set_text', None)",
+            "        if old_set:",
+            "            def tset(self, text, *args, **kwargs):",
+            "                try:",
+            "                    style = getattr(self, 'style', '')",
+            "                    style_s = _st_text_type(style or '').lower()",
+            "                    if ('say_dialogue' in style_s) or ('nvl_dialogue' in style_s) or ('say' == style_s):",
+            "                        s = _st_clean(text)",
+            "                        if _st_is_dialogue_like(s):",
+            "                            _st_send(s, 'renpy:text:set_text')",
+            "                except Exception:",
+            "                    pass",
+            "                return old_set(self, text, *args, **kwargs)",
+            "            _st_text.Text.set_text = tset",
+            "            ok = True",
             "    except Exception:",
             "        pass",
+            "    try:",
+            "        import renpy.display.text as _st_dtext",
+            "        dtext = getattr(_st_dtext, 'Text', None)",
+            "        if dtext and hasattr(dtext, '__init__'):",
+            "            old_dinit = dtext.__init__",
+            "            def dinit(self, text, *args, **kwargs):",
+            "                try:",
+            "                    s = _st_clean(text)",
+            "                    if _st_is_dialogue_like(s):",
+            "                        _st_send(s, 'renpy:dtext:init')",
+            "                except Exception:",
+            "                    pass",
+            "                return old_dinit(self, text, *args, **kwargs)",
+            "            dtext.__init__ = dinit",
+            "            ok = True",
+            "        old_dset = getattr(dtext, 'set_text', None) if dtext else None",
+            "        if old_dset:",
+            "            def dset(self, text, *args, **kwargs):",
+            "                try:",
+            "                    s = _st_clean(text)",
+            "                    if _st_is_dialogue_like(s):",
+            "                        _st_send(s, 'renpy:dtext:set_text')",
+            "                except Exception:",
+            "                    pass",
+            "                return old_dset(self, text, *args, **kwargs)",
+            "            dtext.set_text = dset",
+            "            ok = True",
+            "    except Exception:",
+            "        pass",
+            "    try:",
+            "        import renpy.display.core as _st_core",
+            "        old_interact = getattr(_st_core.Interface, 'interact', None)",
+            "        if old_interact:",
+            "            def _st_interact(self, *args, **kwargs):",
+            "                rv = old_interact(self, *args, **kwargs)",
+            "                try:",
+            "                    import renpy",
+            "                    t = ''",
+            "                    label = 'renpy:interact'",
+            "                    try:",
+            "                        t, label = _st_get_screen_what('renpy:interact:screen')",
+            "                    except Exception:",
+            "                        t, label = '', 'renpy:interact'",
+            "                    try:",
+            "                        if not t:",
+            "                            t = renpy.exports.last_say_what() or ''",
+            "                            if t: label = 'renpy:interact:last_say_what'",
+            "                    except Exception:",
+            "                        t = ''",
+            "                    if not t:",
+            "                        try:",
+            "                            ls = renpy.exports.last_say()",
+            "                            if isinstance(ls, (list, tuple)) and len(ls) >= 2:",
+            "                                t = ls[1] or ''",
+            "                                if t: label = 'renpy:interact:last_say'",
+            "                        except Exception:",
+            "                            t = ''",
+            "                    if not t:",
+            "                        try:",
+            "                            h = getattr(renpy.store, '_history_list', None)",
+            "                            if h and len(h) > 0:",
+            "                                for x in reversed(h):",
+            "                                    k = _st_text_type(getattr(x, 'kind', '') or '').lower()",
+            "                                    if k != 'current':",
+            "                                        continue",
+            "                                    t = getattr(x, 'what', '') or ''",
+            "                                    if t:",
+            "                                        label = 'renpy:interact:history_current'",
+            "                                        break",
+            "                        except Exception:",
+            "                            t = ''",
+            "                    if t:",
+            "                        _st_send(t, label)",
+                "                except Exception:",
+                "                    pass",
+                "                return rv",
+            "            _st_core.Interface.interact = _st_interact",
+            "            ok = True",
+            "    except Exception:",
+            "        pass",
+            "    if not ok:",
+            "        try:",
+            "            ex = getattr(renpy, 'exports', None)",
+            "            if ex and (hasattr(ex, 'last_say_what') or hasattr(ex, 'last_say')):",
+            "                ok = True",
+            "        except Exception:",
+            "            pass",
+            "    if ok:",
+            "        try:",
+            "            renpy._st_patched = True",
+            "            renpy._st_patch_rev = 10",
+            "        except Exception: pass",
+            "    # Avoid patching high-frequency text internals to reduce noise/instability on Ren'Py 6/7",
             "    return ok",
             "def _st_install():",
             "    while True:",
@@ -1179,22 +2152,441 @@ class HookTextThread(QThread):
             "            continue",
             "        try:",
             "            if _st_patch():",
-            "                _st_send('[HOOK_READY]')",
+            "                try:",
+            "                    import renpy",
+            "                    if getattr(renpy, '_st_poll_rev', 0) < 10:",
+            "                        renpy._st_poll_started = True",
+            "                        renpy._st_poll_rev = 10",
+            "                        _th_poll = threading.Thread(target=_st_poll_dialog, args=(10,))",
+            "                        try: _th_poll.setDaemon(True)",
+            "                        except Exception:",
+            "                            try: _th_poll.daemon = True",
+            "                            except Exception: pass",
+            "                        _th_poll.start()",
+            "                except Exception:",
+            "                    pass",
+            "                _st_send('[HOOK_READY]', 'renpy:ready')",
             "                break",
             "        except Exception:",
             "            pass",
             "        time.sleep(0.5)",
-            "threading.Thread(target=_st_install, daemon=True).start()",
+            "_th_install = threading.Thread(target=_st_install)",
+            "try: _th_install.setDaemon(True)",
+            "except Exception:",
+            "    try: _th_install.daemon = True",
+            "    except Exception: pass",
+            "_th_install.start()",
           ];
-          const code = codeLines.join("\\n");
-          const buf = Memory.allocUtf8String(code);
+          const minimalCodeLines = [
+            "import time, json",
+            "try:",
+            "    import thread as _st_thread",
+            "except Exception:",
+            "    _st_thread = None",
+            "try:",
+            "    import _socket as _st_sockmod",
+            "except Exception:",
+            "    try:",
+            "        import socket as _st_sockmod",
+            "    except Exception:",
+            "        _st_sockmod = None",
+            "try:",
+            "    _st_text_type = unicode",
+            "    _st_basestring = basestring",
+            "except NameError:",
+            "    _st_text_type = str",
+            "    _st_basestring = str",
+            "_st_last = u''",
+            "_st_last_ts = 0.0",
+            "def _st_to_text(v, depth=0):",
+            "    try:",
+            "        if depth > 4 or v is None: return u''",
+            "        if isinstance(v, _st_text_type): return v",
+            "        if isinstance(v, _st_basestring):",
+            "            try: return v.decode('utf-8', 'ignore')",
+            "            except Exception:",
+            "                try: return _st_text_type(v)",
+            "                except Exception: return u''",
+            "        if isinstance(v, (list, tuple)):",
+            "            out = []",
+            "            for it in v:",
+            "                s = _st_to_text(it, depth + 1)",
+            "                if s: out.append(s)",
+            "            return u' '.join(out)",
+            "        if isinstance(v, dict):",
+            "            out = []",
+            "            for k in ('what', 'text', 'say', 'content', 'value'):",
+            "                if k in v:",
+            "                    s = _st_to_text(v.get(k), depth + 1)",
+            "                    if s: out.append(s)",
+            "            if out: return u' '.join(out)",
+            "        for attr in ('what', 'text', 'string', 'content', 'contents'):",
+            "            try:",
+            "                if hasattr(v, attr):",
+            "                    s = _st_to_text(getattr(v, attr), depth + 1)",
+            "                    if s: return s",
+            "            except Exception:",
+            "                pass",
+            "        try: return _st_text_type(v)",
+            "        except Exception: return u''",
+            "    except Exception:",
+            "        return u''",
+            "def _st_strip_tags(s):",
+            "    try:",
+            "        out = []",
+            "        depth = 0",
+            "        for ch in s:",
+            "            if ch == '{':",
+            "                depth += 1",
+            "                continue",
+            "            if depth > 0:",
+            "                if ch == '}':",
+            "                    depth -= 1",
+            "                continue",
+            "            out.append(ch)",
+            "        return u''.join(out)",
+            "    except Exception:",
+            "        return s",
+            "def _st_clean(s):",
+            "    try:",
+            "        s = _st_to_text(s)",
+            "        if not s: return u''",
+            "        s = _st_strip_tags(s)",
+            "        s = s.replace(u'\\r', u' ').replace(u'\\n', u' ').replace(u'\\t', u' ')",
+            "        s = u' '.join(s.split())",
+            "        return s.strip()",
+            "    except Exception:",
+            "        return u''",
+            "def _st_is_dialogue_like(s):",
+            "    try:",
+            "        if not s or len(s) < 2: return False",
+            "        low = s.lower()",
+            "        for bad in ('.png', '.jpg', '.ogg', '.rpy', '.rpa', '.save', 'persistent.', 'main_menu', 'menu_', 'viewport', 'screen ', 'transform', 'python:', 'label ', 'style_prefix', 'button_text', 'say_window', 'keymap', 'xalign', 'yalign', 'child_size'):",
+            "            if bad in low: return False",
+            "        for bad in ('==', '!=', '<=', '>=', '::', 'return ', 'call ', 'jump ', ' if ', ' elif ', ' while ', ' for ', 'lambda ', ' not ', ' and ', ' or '):",
+            "            if bad in low: return False",
+            "        if s.startswith('_') or s.startswith('%') or s.endswith('$'): return False",
+            "        if s.startswith('<') and s.endswith('>'): return False",
+            "        if s.startswith('[') and s.endswith(']'): return False",
+            "        if s.startswith('{') and s.endswith('}'): return False",
+            "        if len(s) >= 2 and s[1:2] == ':' and s[0:1].isalpha(): return False",
+            "        only_word = True",
+            "        has_us = False",
+            "        for ch in s:",
+            "            if not (ch.isalnum() or ch == '_'):",
+            "                only_word = False",
+            "                break",
+            "            if ch == '_': has_us = True",
+            "        if only_word and has_us and s[:1].islower(): return False",
+            "        total = 0",
+            "        sym = 0",
+            "        for ch in s:",
+            "            if ch.isspace(): continue",
+            "            total += 1",
+            "            if ch in u'{}[]()<>|\\\\/*=:+`~$%^&_#@':",
+            "                sym += 1",
+            "        if total > 0 and (float(sym) / float(total)) > 0.30: return False",
+            "        return True",
+            "    except Exception:",
+            "        return False",
+            "def _st_send_raw(msg, label=u'renpy'):",
+            "    if _st_sockmod is None or not msg: return",
+            "    c = None",
+            "    try:",
+            "        payload = {u'text': _st_clean(msg), u'source': u'socket', u'label': _st_to_text(label or u'renpy')}",
+            "        if not payload[u'text']: return",
+            "        data = json.dumps(payload, ensure_ascii=False)",
+            "        c = _st_sockmod.socket(_st_sockmod.AF_INET, _st_sockmod.SOCK_STREAM)",
+            "        c.connect(('__HOOK_HOST__', __HOOK_PORT__))",
+            "        if isinstance(data, _st_text_type):",
+            "            data = (data + u'\\n').encode('utf-8', 'ignore')",
+            "        else:",
+            "            data = (str(data) + '\\n').encode('utf-8', 'ignore')",
+            "        c.send(data)",
+            "    except Exception:",
+            "        pass",
+            "    try:",
+            "        if c is not None: c.close()",
+            "    except Exception:",
+            "        pass",
+            "def _st_send(t, label=u'renpy'):",
+            "    global _st_last, _st_last_ts",
+            "    try:",
+            "        s = _st_clean(t)",
+            "        if not s: return",
+            "        _now = time.time()",
+            "        if s == _st_last and (_now - float(_st_last_ts or 0.0)) < 0.65: return",
+            "        if len(s) < 2:",
+            "            _keep_short = False",
+            "            try:",
+            "                for _ch in s:",
+            "                    _cp = ord(_ch)",
+            "                    if (0x3040 <= _cp <= 0x30FF) or (0x4E00 <= _cp <= 0x9FFF) or (0xAC00 <= _cp <= 0xD7AF):",
+            "                        _keep_short = True",
+            "                        break",
+            "            except Exception:",
+            "                _keep_short = False",
+            "            if not _keep_short: return",
+            "        if s == u'[HOOK_READY]':",
+            "            _st_last = s",
+            "            _st_last_ts = _now",
+            "            _st_send_raw(s, label or u'renpy:ready')",
+            "            return",
+            "        if not _st_is_dialogue_like(s): return",
+            "        _st_last = s",
+            "        _st_last_ts = _now",
+            "        _st_send_raw(s, label)",
+            "    except Exception:",
+            "        pass",
+            "def _st_get_screen_what(prefix):",
+            "    try:",
+            "        import renpy",
+            "    except Exception:",
+            "        return u'', u''",
+            "    try:",
+            "        gv = getattr(renpy, 'get_screen_variable', None)",
+            "        if not gv:",
+            "            ex = getattr(renpy, 'exports', None)",
+            "            gv = getattr(ex, 'get_screen_variable', None) if ex is not None else None",
+            "        if not gv:",
+            "            return u'', u''",
+            "        for screen_name in (u'say', u'nvl', u'bubble'):",
+            "            try:",
+            "                v = gv('what', screen=screen_name)",
+            "                s = _st_clean(v)",
+            "                if s:",
+            "                    return s, (_st_to_text(prefix) + u':' + screen_name)",
+            "            except Exception:",
+            "                pass",
+            "    except Exception:",
+            "        pass",
+            "    return u'', u''",
+            "def _st_probe():",
+            "    t = u''",
+            "    label = u'renpy:poll'",
+            "    try:",
+            "        import renpy",
+            "    except Exception:",
+            "        return u'', label",
+            "    try:",
+            "        try:",
+            "            t, label = _st_get_screen_what(u'renpy:poll:screen')",
+            "        except Exception:",
+            "            t, label = u'', u'renpy:poll'",
+            "        ex = getattr(renpy, 'exports', None)",
+            "        if (not t) and ex is not None:",
+            "            try:",
+            "                t = ex.last_say_what() or u''",
+            "                if t: label = u'renpy:poll:last_say_what'",
+            "            except Exception: t = u''",
+            "            if not t:",
+            "                try:",
+            "                    ls = ex.last_say()",
+            "                    if isinstance(ls, (list, tuple)) and len(ls) >= 2:",
+            "                        t = ls[1] or u''",
+            "                        if t: label = u'renpy:poll:last_say'",
+            "                except Exception:",
+            "                    t = u''",
+            "        if not t:",
+            "            try:",
+            "                st = getattr(renpy, 'store', None)",
+            "                h = getattr(st, '_history_list', None) if st is not None else None",
+            "                if h and len(h) > 0:",
+            "                    for x in reversed(h):",
+            "                        k = _st_to_text(getattr(x, 'kind', u'') or u'').lower()",
+            "                        if k != u'current':",
+            "                            continue",
+            "                        t = getattr(x, 'what', u'') or u''",
+            "                        if t:",
+            "                            label = u'renpy:poll:history_current'",
+            "                            break",
+            "            except Exception:",
+            "                t = u''",
+            "    except Exception:",
+            "        t = u''",
+            "    return t, label",
+            "def _st_loop(rev):",
+            "    while True:",
+            "        try:",
+            "            try:",
+            "                import renpy",
+            "                if getattr(renpy, '_st_poll_rev', 0) != rev: return",
+            "            except Exception:",
+            "                pass",
+            "            t, label = _st_probe()",
+            "            _st_send(t, label)",
+            "        except Exception:",
+            "            pass",
+            "        time.sleep(0.08)",
+            "try:",
+            "    import renpy",
+            "    if getattr(renpy, '_st_poll_rev', 0) < 10:",
+            "        renpy._st_poll_started = True",
+            "        renpy._st_poll_rev = 10",
+            "        if _st_thread is not None:",
+            "            _st_thread.start_new_thread(_st_loop, (10,))",
+            "        _st_send_raw('[HOOK_READY]', u'renpy:ready')",
+            "except Exception:",
+            "    pass",
+          ];
+          const fullBody = codeLines.join("\n");
+          const minimalBody = minimalCodeLines.join("\n");
+          function buildWrapped(scriptBody) {
+            return [
+              "_st_src = " + JSON.stringify(scriptBody),
+              "try:",
+              "    _st_co = compile(_st_src, '<st_hook>', 'exec')",
+              "    eval(_st_co, globals(), globals())",
+              "except Exception as e:",
+              "    try:",
+              "        import _socket as _st_sockmod",
+              "        _st_msg = '[HOOK_ERR] ' + e.__class__.__name__ + ': ' + str(e)",
+              "        _st_c = _st_sockmod.socket(_st_sockmod.AF_INET, _st_sockmod.SOCK_STREAM)",
+              "        _st_c.connect(('__HOOK_HOST__', __HOOK_PORT__))",
+              "        try:",
+              "            _st_data = (_st_msg + '\\n').encode('utf-8', 'ignore')",
+              "        except Exception:",
+              "            _st_data = (_st_msg + '\\n')",
+              "        _st_c.send(_st_data)",
+              "        _st_c.close()",
+              "    except Exception:",
+              "        pass",
+            ].join("\n");
+          }
+          function pyQuoteSingle(text) {
+            try {
+              return "'" + String(text || "").replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
+            } catch (e) {
+              return "''";
+            }
+          }
+          function writeRenpyTempScript(scriptText) {
+            try {
+              if (typeof File === "undefined") {
+                send({ status: "debug_renpy_file_unavailable" });
+                return null;
+              }
+              let basePath = "";
+              try {
+                if (Process.mainModule && Process.mainModule.path) {
+                  basePath = String(Process.mainModule.path || "");
+                }
+              } catch (e) {}
+              if (!basePath) {
+                send({ status: "debug_renpy_file_nopath" });
+                return null;
+              }
+              const norm = basePath.replace(/\\/g, "/");
+              const slash = norm.lastIndexOf("/");
+              const dir = slash >= 0 ? norm.substring(0, slash) : ".";
+              const path = dir + "/st_hook_" + HOOK_PORT + ".py";
+              const file = new File(path, "wb");
+              try {
+                file.write(scriptText);
+                file.flush();
+              } finally {
+                try { file.close(); } catch (e) {}
+              }
+              send({ status: "debug_renpy_file_written: " + path });
+              return path;
+            } catch (e) {
+              send({ status: "debug_renpy_file_write_failed: " + e });
+              return null;
+            }
+          }
+          function runRenpyScript(scriptBody) {
+            const result = {
+              ok: false,
+              pyOk: false,
+              fileOk: false,
+              pyDetail: "",
+              fileDetail: "",
+              scriptPath: "",
+            };
+            try {
+              const wrappedText = buildWrapped(scriptBody);
+              const buf = Memory.allocUtf8String(wrappedText);
+              try {
+                result.pyOk = runPyCode(buf);
+              } catch (e) {
+                result.pyDetail = "PyRun exception: " + e;
+                return result;
+              }
+              if (!result.pyOk) {
+                result.pyDetail = readPyErrorDetail() || "";
+                result.scriptPath = writeRenpyTempScript(scriptBody) || "";
+                if (result.scriptPath) {
+                  try {
+                    const execCode = "execfile(" + pyQuoteSingle(result.scriptPath.replace(/\//g, "\\\\")) + ")";
+                    const execBuf = Memory.allocUtf8String(execCode);
+                    send({ status: "debug_renpy_execfile_try: " + result.scriptPath });
+                    result.fileOk = runPyCode(execBuf);
+                  } catch (e) {
+                    result.fileDetail = "execfile exception: " + e;
+                  }
+                  if (!result.fileOk && !result.fileDetail) {
+                    result.fileDetail = readPyErrorDetail() || "";
+                  }
+                  if (!result.fileOk) {
+                    send({ status: "debug_renpy_execfile_failed: " + (result.fileDetail || "unknown") });
+                  }
+                }
+              }
+              result.ok = !!(result.pyOk || result.fileOk);
+            } catch (e) {
+              result.fileDetail = (e && e.toString) ? e.toString() : "";
+            }
+            return result;
+          }
+          const smoke = Memory.allocUtf8String("x=1");
           try {
             let state = 0;
             if (PyEval_InitThreads) PyEval_InitThreads();
             if (PyGIL_Ensure) state = PyGIL_Ensure();
-            PyRun(buf);
+            let smokeOk = false;
+            try {
+              smokeOk = runPyCode(smoke);
+            } catch (e) {
+              send({ status: "renpy_inject_failed", error: "PyRun smoke exception: " + e });
+              if (PyGIL_Release) PyGIL_Release(state);
+              return false;
+            }
+            if (!smokeOk) {
+              const detail = readPyErrorDetail();
+              if (PyGIL_Release) PyGIL_Release(state);
+              send({ status: "renpy_inject_failed", error: detail ? ("PyRun smoke failed " + detail) : "PyRun smoke failed" });
+              return false;
+            }
+            const fullResult = runRenpyScript(fullBody);
+            if (fullResult.ok) {
+              if (PyGIL_Release) PyGIL_Release(state);
+              _renpyTextOnly = false;
+              send({ status: "renpy_injected" });
+              return true;
+            }
+            let fullDetail = fullResult.pyDetail || "";
+            if (fullResult.fileDetail) {
+              fullDetail = fullDetail ? (fullDetail + " | execfile " + fullResult.fileDetail) : ("execfile " + fullResult.fileDetail);
+            }
+            if (fullDetail) {
+              send({ status: "debug_renpy_full_failed: " + fullDetail });
+            }
+            const minimalResult = runRenpyScript(minimalBody);
             if (PyGIL_Release) PyGIL_Release(state);
-            send({ status: "renpy_injected" });
+            if (!minimalResult.ok) {
+              let detail = fullDetail || "";
+              let minimalDetail = minimalResult.pyDetail || "";
+              if (minimalResult.fileDetail) {
+                minimalDetail = minimalDetail ? (minimalDetail + " | execfile " + minimalResult.fileDetail) : ("execfile " + minimalResult.fileDetail);
+              }
+              if (minimalDetail) {
+                detail = detail ? (detail + " | minimal " + minimalDetail) : ("minimal " + minimalDetail);
+              }
+              send({ status: "renpy_inject_failed", error: detail ? ("PyRun failed " + detail) : "PyRun failed" });
+              return false;
+            }
+            _renpyTextOnly = true;
+            send({ status: "renpy_injected_minimal" });
             return true;
           } catch (e) {
             send({ status: "renpy_inject_failed", error: (e && e.toString) ? e.toString() : "" });
@@ -1477,15 +2869,23 @@ class HookTextThread(QThread):
             "TTF_RenderGlyph32_LCD_V"
           ];
           function hookAddr(addr, handler) {
-            if (!addr || addr.isNull()) return false;
-            Interceptor.attach(addr, handler);
-            return true;
+            try {
+              if (!addr || addr.isNull()) return false;
+              Interceptor.attach(addr, handler);
+              return true;
+            } catch (e) {
+              return false;
+            }
           }
           function hookExport(name, handler) {
-            const addr = Module.findExportByName(modName, name);
-            if (!addr) return false;
-            Interceptor.attach(addr, handler);
-            return true;
+            try {
+              const addr = findExport(modName, name);
+              if (!addr || addr.isNull()) return false;
+              Interceptor.attach(addr, handler);
+              return true;
+            } catch (e) {
+              return false;
+            }
           }
           let ok = false;
           const utf8Handler = {
@@ -1564,11 +2964,22 @@ class HookTextThread(QThread):
                     }
                     // Optimized filter for high-frequency calls
                     if (text && text.length > 1) {
-                         const s = text;
-                         // Basic junk filter to avoid spamming sendText
-                         if (s.indexOf(".py") === -1 && s.indexOf("/") === -1 && s.indexOf("\\") === -1 && s.indexOf("<") === -1) {
-                             sendText(s, "PythonAPI:" + name);
-                         }
+                         const s = text.trim();
+                         const sl = s.toLowerCase();
+                         const isPyString = name.indexOf("PyString_") === 0;
+                         const likelyDialogue =
+                           /[\u3040-\u30ff\u4e00-\u9fff\uac00-\ud7af]/.test(s) ||
+                           (/[A-Za-z]/.test(s) && (/\s/.test(s) || /[.!?,"']$/.test(s) || s.length >= 12));
+                         if (!s) return;
+                         if (s.indexOf(".py") !== -1 || s.indexOf("/") !== -1 || s.indexOf("\\") !== -1 || s.indexOf("<") !== -1) return;
+                         if (/^[a-z]:$/i.test(sl) || /^\.[a-z0-9]{2,5}$/.test(sl)) return;
+                         if (/\.(png|jpe?g|ogg|mp3|wav|dll|exe|rpy|rpa|save)\b/i.test(sl)) return;
+                         if (/(==|!=|<=|>=|::|->|\{#|\bpersistent\.|\bmain_menu\b|\bviewport\b|\bstyle_prefix\b|\bbutton_text\b|\bsay_window\b|\bkeymap\b|\bxalign\b|\byalign\b|\bchild_size\b|\bpy_repr\b)/i.test(sl)) return;
+                         if (/^\([^)]*\)$/.test(s) && /\b(not|and|or|if|elif|else)\b/i.test(sl)) return;
+                         if (/^[a-z_][a-z0-9_]*\([^)]*\)$/i.test(sl)) return;
+                         if (/\b[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*\b/i.test(sl)) return;
+                         if (isPyString && !likelyDialogue) return;
+                         sendText(s, "PythonAPI:" + name);
                     }
                 } catch(e) {}
               }
@@ -1614,6 +3025,9 @@ class HookTextThread(QThread):
         let sdlHooked = false;
         let pyHooked = false;
         let renpyInjected = false;
+        let renpyDisabled = !ENABLE_RENPY_INJECTION;
+        let renpyDisabledNotified = false;
+        const renpyLightMode = !!ENABLE_RENPY_INJECTION;
         let sdlAttempts = 0;
         let pyAttempts = 0;
         let renpyAttempts = 0;
@@ -1640,13 +3054,29 @@ class HookTextThread(QThread):
           return ok;
         }
         function tryInjectRenpyOnce() {
+          if (!ENABLE_RENPY_INJECTION || renpyDisabled) {
+            if (!renpyDisabledNotified) {
+              renpyDisabledNotified = true;
+              send({ status: "renpy_disabled", reason: "stability_mode" });
+            }
+            return false;
+          }
           if (renpyInjected) return true;
           if (renpyAttempts === 0) send({ status: "renpy_trying" });
           const ok = tryInjectRenpy();
-          if (ok) renpyInjected = true;
+          if (ok) {
+            renpyInjected = true;
+          } else {
+            renpyDisabled = true;
+            if (!renpyDisabledNotified) {
+              renpyDisabledNotified = true;
+              send({ status: "renpy_disabled", reason: "inject_failed" });
+            }
+          }
           return ok;
         }
         function forceRenpyTick() {
+          if (!ENABLE_RENPY_INJECTION || renpyDisabled) return;
           if (renpyInjected) return;
           renpyForceAttempts += 1;
           if (renpyForceAttempts === 1) send({ status: "renpy_force_start" });
@@ -1655,6 +3085,12 @@ class HookTextThread(QThread):
             renpyInjected = true;
             return;
           }
+          renpyDisabled = true;
+          if (!renpyDisabledNotified) {
+            renpyDisabledNotified = true;
+            send({ status: "renpy_disabled", reason: "force_failed" });
+          }
+          return;
           if (renpyForceAttempts >= 80) {
             send({ status: "renpy_force_failed" });
             return;
@@ -1668,25 +3104,30 @@ class HookTextThread(QThread):
               send({ status: "retry_started" });
             }
             reportModulesOnce();
-            if (!sdlHooked) {
+            if (!renpyLightMode && !sdlHooked) {
               sdlAttempts += 1;
               tryHookSDLTTF();
               if (!sdlHooked && sdlAttempts === 1) send({ status: "sdl_ttf_retrying" });
               if (!sdlHooked && sdlAttempts === 40) send({ status: "sdl_ttf_not_found" });
             }
-            if (!pyHooked) {
+            if (!renpyLightMode && !pyHooked) {
               pyAttempts += 1;
               tryHookPython();
               if (!pyHooked && pyAttempts === 1) send({ status: "python_retrying" });
               if (!pyHooked && pyAttempts === 40) send({ status: "python_not_found" });
             }
-            if (!renpyInjected) {
+            if (ENABLE_RENPY_INJECTION && !renpyDisabled && !renpyInjected) {
               renpyAttempts += 1;
               tryInjectRenpyOnce();
               if (!renpyInjected && renpyAttempts === 1) send({ status: "renpy_retrying" });
               if (!renpyInjected && renpyAttempts === 40) send({ status: "renpy_inject_failed" });
             }
-            if (!sdlHooked || !pyHooked || !renpyInjected) {
+            const needRenpy = ENABLE_RENPY_INJECTION && !renpyDisabled;
+            let needRetry = (needRenpy && !renpyInjected);
+            if (!renpyLightMode) {
+              needRetry = needRetry || !sdlHooked || !pyHooked;
+            }
+            if (needRetry) {
               setTimeout(retryHooks, 2000);
             }
           } catch (e) {
@@ -1793,17 +3234,15 @@ class HookTextThread(QThread):
               },
               onLeave(_ret) {
                 const p = (this._path || "").toLowerCase();
-                if (p.indexOf("ttf") >= 0) {
+                if (!renpyLightMode && p.indexOf("ttf") >= 0) {
                   tryHookSDLTTF();
                 }
-                if (p.indexOf("python") >= 0 && p.indexOf(".dll") >= 0) {
+                if (!renpyLightMode && p.indexOf("python") >= 0 && p.indexOf(".dll") >= 0) {
                   tryHookPython();
                   tryInjectRenpyOnce();
-                  forceRenpyTick();
                 }
                 if (p.indexOf("renpy") >= 0) {
                   tryInjectRenpyOnce();
-                  forceRenpyTick();
                 }
                 if (p.indexOf("dwrite") >= 0) {
                    hookDirectWrite();
@@ -2022,6 +3461,7 @@ class HookTextThread(QThread):
         send({ status: "debug_main_start" });
         let ok = false;
         try {
+            if (!renpyLightMode) {
             ok = hookGdi("TextOutW", "gdi32.dll", {
               onEnter(args) {
                 const text = readW(args[3], args[4]);
@@ -2105,33 +3545,42 @@ class HookTextThread(QThread):
             hookGdi("CreateFontIndirectW", "gdi32.dll", { onEnter(args) {} });
             hookGdi("CreateFontA", "gdi32.dll", { onEnter(args) {} });
             hookGdi("CreateFontIndirectA", "gdi32.dll", { onEnter(args) {} });
+            }
         } catch(e) {
             send({ status: "debug_gdi_fail: " + e });
         }
         send({ status: "debug_main_gdi_done" });
-        ok = hookDirectWrite() || ok;
-        ok = hookGdiPlus() || ok;
-        ok = hookD3DX() || ok;
-        ok = hookMono() || ok;
-        ok = hookIl2cpp() || ok;
-        ok = hookD3DPresent() || ok;
-        ok = hookGetGlyphOutline() || ok;
-        ok = hookGdiExtras() || ok;
-        hookKernel32(); 
-        // hookGdiMeasure(); // Disabled to prevent spam/crash
-        ok = tryHookSDLTTF() || ok;
-        ok = tryHookPython() || ok;
+        if (!renpyLightMode) {
+          ok = hookDirectWrite() || ok;
+          ok = hookGdiPlus() || ok;
+          ok = hookD3DX() || ok;
+          ok = hookMono() || ok;
+          ok = hookIl2cpp() || ok;
+          ok = hookD3DPresent() || ok;
+          ok = hookGetGlyphOutline() || ok;
+          ok = hookGdiExtras() || ok;
+          hookKernel32(); 
+          // hookGdiMeasure(); // Disabled to prevent spam/crash
+          ok = tryHookSDLTTF() || ok;
+          ok = tryHookPython() || ok;
+        } else {
+          send({ status: "renpy_light_mode" });
+        }
         tryInjectRenpyOnce();
-        forceRenpyTick();
         hookLoadLibrary();
         retryHooks();
-        if (!ok) {
+        if (!ok && !renpyLightMode) {
           send({ status: "no_hook" });
         }
         send({ status: "debug_main_end" });
         setTimeout(function() { send({ status: "hook_ready_delayed" }); }, STARTUP_DELAY_MS);
         """
-        script_src = script_src.replace("__HOOK_HOST__", out_host).replace("__HOOK_PORT__", str(out_port))
+        script_src = (
+            script_src
+            .replace("__HOOK_HOST__", out_host)
+            .replace("__HOOK_PORT__", str(out_port))
+            .replace("__ENABLE_RENPY_INJECTION__", "1" if self._enable_renpy_injection else "0")
+        )
 
         def _on_message(msg, _data):
             try:
@@ -2235,15 +3684,55 @@ class HookTextThread(QThread):
                     return
                 if status == "renpy_force_failed":
                     return
+                if status == "renpy_disabled":
+                    try:
+                        reason = str(payload.get("reason") or "").strip()
+                    except Exception:
+                        reason = ""
+                    try:
+                        if reason:
+                            self.status.emit(f"Hook Ren'Py injection disabled: {reason}")
+                        else:
+                            self.status.emit("Hook Ren'Py injection disabled")
+                    except Exception:
+                        pass
+                    return
                 if status == "renpy_injected":
                     try:
                         self.status.emit("Hook Ren'Py 注入已完成")
                     except Exception:
                         pass
                     return
+                if status == "renpy_injected_minimal":
+                    try:
+                        self.status.emit("Hook Ren'Py fallback enabled")
+                    except Exception:
+                        pass
+                    return
+                if status == "renpy_light_mode":
+                    try:
+                        self.status.emit("Hook Ren'Py 轻量模式（已禁用高频渲染钩子）")
+                    except Exception:
+                        pass
+                    return
                 if status == "renpy_no_pyrun":
+                    try:
+                        self.status.emit("Hook Ren'Py inject failed: PyRun symbol not found")
+                    except Exception:
+                        pass
                     return
                 if status == "renpy_inject_failed":
+                    try:
+                        err = str(payload.get("error") or "").strip()
+                    except Exception:
+                        err = ""
+                    try:
+                        if err:
+                            self.status.emit(f"Hook Ren'Py inject failed: {err}")
+                        else:
+                            self.status.emit("Hook Ren'Py inject failed")
+                    except Exception:
+                        pass
                     return
                 if status == "python_hooked":
                     try:
@@ -2283,8 +3772,16 @@ class HookTextThread(QThread):
                     return
                 text = payload.get("text", "")
                 label = str(payload.get("label") or "").strip()
+                source = str(payload.get("source") or "frida").strip().lower() or "frida"
+                thread_id = self._coerce_int(payload.get("threadId", payload.get("thread_id")))
                 if text:
-                    self._emit_text_with_source(text, "frida")
+                    self._emit_text_with_source(
+                        text,
+                        source,
+                        label=label,
+                        thread_id=thread_id,
+                        pid=self._pid,
+                    )
             except Exception:
                 pass
 
@@ -2529,40 +4026,12 @@ class HookTextThread(QThread):
                             pass
                         return
 
-                    # 尝试自动启动 32 位 Agent
-                    agent_path = self._find_32bit_agent()
-                    if agent_path:
-                        try:
-                            self.status.emit(f"Hook 尝试启动 32 位辅助进程: {agent_path}")
-                            import subprocess
-                            
-                            # Use STARTUPINFO to hide the console window
-                            startupinfo = None
-                            creationflags = 0
-                            if os.name == "nt":
-                                try:
-                                    startupinfo = subprocess.STARTUPINFO()
-                                    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                                    startupinfo.wShowWindow = 0 # SW_HIDE
-                                    creationflags = subprocess.CREATE_NO_WINDOW
-                                except Exception:
-                                    pass
-
-                            # 传递 PID 和 端口 (使用 argparse 参数格式)
-                            self._agent_process = subprocess.Popen(
-                                [
-                                    agent_path,
-                                    "--pid", str(self._pid),
-                                    "--port", str(self._listen_port)
-                                ],
-                                startupinfo=startupinfo,
-                                creationflags=creationflags
-                            )
-                            self.status.emit("Hook 32 位辅助进程已启动")
-                        except Exception as e:
-                            self.status.emit(f"Hook 启动 32 位辅助进程失败: {e}")
-                    else:
-                        self.status.emit("Hook 未找到 32 位 HookAgent，无法注入 32 位进程")
+                    # Do not relaunch helper here; main window controls helper lifecycle.
+                    # Keeping only socket listener avoids duplicate helper races/crash loops.
+                    try:
+                        self.status.emit("Hook 架构不匹配：等待主程序切换并启动对应位数辅助进程")
+                    except Exception:
+                        pass
 
                     # 仅保留外部端口监听，用于由32位注入助手回传文本
                     if not bool(self._enable_socket):
