@@ -28,13 +28,16 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QGraphicsDropShadowEffect,
     QStackedWidget,
+    QPlainTextEdit,
     QTableWidget,
     QTableWidgetItem,
+    QAbstractItemView,
+    QHeaderView,
     QListWidget,
     QListWidgetItem,
 )
 from PyQt6.QtCore import Qt, QRect, QSize, QThread, pyqtSignal, QTimer, QBuffer, QIODevice, QUrl, QObject, QEvent, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QIcon, QAction, QActionGroup, QFont, QDesktopServices, QTextCursor, QColor, QScreen, QGuiApplication
+from PyQt6.QtGui import QIcon, QAction, QActionGroup, QFont, QDesktopServices, QTextCursor, QColor, QScreen, QGuiApplication, QShortcut, QKeySequence
 import io
 import re
 
@@ -53,6 +56,7 @@ from src.core.languages import (
 from src.ui.language_picker import LanguagePickerDialog
 from src.ui.language_manager import LanguageManager
 from src.core.hook_client import HookTextThread, hook_log
+from src.utils.sqlite import TranslationReuseCache
 
 
 class _ShadowHoverFilter(QObject):
@@ -225,6 +229,8 @@ class _TranslationThread(QThread):
         translator=None,  # 复用已加载的翻译器实例
         model_path: str = None,  # 仅当translator为None时使用
         glossary_entries: list[tuple[str, str]] | None = None,
+        reuse_enabled: bool = False,
+        reuse_cache: TranslationReuseCache | None = None,
     ):
         super().__init__()
         self.text = text
@@ -234,14 +240,34 @@ class _TranslationThread(QThread):
         self.translator = translator  # 复用翻译器实例
         self.model_path = model_path  # 备用：仅在translator为None时使用
         self.glossary_entries = glossary_entries or []
+        self.reuse_enabled = bool(reuse_enabled)
+        self.reuse_cache = reuse_cache
 
     def run(self):
         try:
+            cached_text = None
+            if self.reuse_enabled and self.reuse_cache is not None:
+                try:
+                    cached_text = self.reuse_cache.get(self.text, self.source_lang, self.target_lang)
+                except Exception:
+                    cached_text = None
+            if cached_text:
+                self.translation_finished.emit(_TranslationResult(
+                    success=True,
+                    translated_text=str(cached_text),
+                    original_text=self.text
+                ))
+                return
+
             # 复用已加载的翻译器实例，避免重复加载模型
             if self.translator is None:
                 # 仅在translator未提供时才创建新实例（不推荐，会导致重复加载）
                 from src.core.local_translator import LocalAITranslator
-                self.translator = LocalAITranslator(self.model_path) if self.model_path else LocalAITranslator()
+                self.translator = (
+                    LocalAITranslator(self.model_path, load_model_immediately=False)
+                    if self.model_path
+                    else LocalAITranslator(load_model_immediately=False)
+                )
 
             def _translate_one(s: str) -> str:
                 if not s:
@@ -361,6 +387,16 @@ class _TranslationThread(QThread):
                 translated_text = _translate_one(text_in)
             
             if translated_text:
+                if self.reuse_enabled and self.reuse_cache is not None:
+                    try:
+                        translated_text = self.reuse_cache.save(
+                            self.text,
+                            self.source_lang,
+                            self.target_lang,
+                            translated_text,
+                        )
+                    except Exception:
+                        pass
                 self.translation_finished.emit(_TranslationResult(
                     success=True,
                     translated_text=translated_text,
@@ -616,13 +652,13 @@ class _TranslatorInitThread(QThread):
 
     def run(self):
         try:
-            self.progress.emit("正在加载本地翻译模型...")
+            self.progress.emit("正在初始化本地翻译器（模型按需加载）...")
             from src.core.local_translator import LocalAITranslator
             from src.utils.resource_monitor import get_process_stats, get_gpu_stats
 
             ps_before = get_process_stats()
             gs_before = get_gpu_stats()
-            translator = LocalAITranslator(self.model_path)
+            translator = LocalAITranslator(self.model_path, load_model_immediately=False)
             ps_after = get_process_stats()
             gs_after = get_gpu_stats()
 
@@ -639,6 +675,7 @@ class _TranslatorInitThread(QThread):
                     else max(0, int(gs_after.reserved_bytes) - int(gs_before.reserved_bytes))
                 ),
                 "device": getattr(translator, "device", None),
+                "lazy_load": True,
             }
             self.init_finished.emit(True, translator, stats)
         except Exception as e:
@@ -704,13 +741,13 @@ class _ComponentInitThread(QThread):
                 self.progress.emit("API模式已启用：跳过本地模型加载")
                 stats["translator"] = {"skipped": True}
             else:
-                self.progress.emit("正在加载本地翻译模型...")
+                self.progress.emit("正在初始化本地翻译器（模型按需加载）...")
                 from src.core.local_translator import LocalAITranslator
                 from src.utils.resource_monitor import get_process_stats, get_gpu_stats
 
                 ps_before = get_process_stats()
                 gs_before = get_gpu_stats()
-                translator = LocalAITranslator(self.model_path)
+                translator = LocalAITranslator(self.model_path, load_model_immediately=False)
                 ps_after = get_process_stats()
                 gs_after = get_gpu_stats()
 
@@ -727,6 +764,7 @@ class _ComponentInitThread(QThread):
                         else max(0, int(gs_after.reserved_bytes) - int(gs_before.reserved_bytes))
                     ),
                     "device": getattr(translator, "device", None),
+                    "lazy_load": True,
                 }
                 components["translator"] = translator
                 self.component_ready.emit("translator", translator, stats["translator"])
@@ -829,6 +867,10 @@ class MainWindow(QMainWindow):
         self._api_provider_probe_ok = None
         self._api_provider_probe_message = ""
         self._api_translator = None
+        self._local_model_missing = False
+        self._local_model_missing_message = (
+            "检测到你并没有本地模型，如需要可以到官网https://14ku.date/download下载"
+        )
         self._api_models: list[str] = []
         try:
             import json
@@ -882,6 +924,13 @@ class MainWindow(QMainWindow):
         self.is_translating = False
         self.last_translation = ""
         self._translation_glossary_maps: dict[int, list[tuple[str, str]]] = {}
+        self._translation_reuse_cache: TranslationReuseCache | None = None
+        self._translation_reuse_entries: list[dict[str, object]] = []
+        self._translation_reuse_page_size = 500
+        self._translation_reuse_next_offset = 0
+        self._translation_reuse_has_more = True
+        self._translation_reuse_loading = False
+        self._translation_reuse_last_query = ""
 
         # 初始化语言管理器
         self.language_manager = LanguageManager(self.config_manager)
@@ -1414,6 +1463,13 @@ class MainWindow(QMainWindow):
         hero_menu.addAction(glossary_action)
         self._hero_menu_actions["glossary"] = glossary_action
 
+        reuse_action = QAction("智能复用", self)
+        reuse_action.setCheckable(True)
+        reuse_action.triggered.connect(self.show_translation_reuse_view)
+        self._hero_menu_view_group.addAction(reuse_action)
+        hero_menu.addAction(reuse_action)
+        self._hero_menu_actions["reuse"] = reuse_action
+
         try:
             main_action.setChecked(True)
         except Exception:
@@ -1479,6 +1535,12 @@ class MainWindow(QMainWindow):
         self._view_glossary_layout.setContentsMargins(0, 0, 0, 0)
         self._view_glossary_layout.setSpacing(self._scale_size(15))
         main_layout.addWidget(self._view_glossary, 1)
+
+        self._view_reuse = QWidget()
+        self._view_reuse_layout = QVBoxLayout(self._view_reuse)
+        self._view_reuse_layout.setContentsMargins(0, 0, 0, 0)
+        self._view_reuse_layout.setSpacing(self._scale_size(15))
+        main_layout.addWidget(self._view_reuse, 1)
         
         # 2. 状态区域（启动期展示：组件状态 + 资源占用）
         status_group = QGroupBox("系统状态")
@@ -1497,10 +1559,10 @@ class MainWindow(QMainWindow):
         self.api_provider_status_label.setVisible(bool(self._api_enabled))
         status_layout.addWidget(self.api_provider_status_label)
 
-        self.model_status_label = QLabel("模型: 初始化中…")
+        self.model_status_label = QLabel("模型: 不可用")
         status_layout.addWidget(self.model_status_label)
 
-        self.model_resource_label = QLabel("模型资源: -")
+        self.model_resource_label = QLabel("模型资源: 不可用")
         status_layout.addWidget(self.model_resource_label)
         self.ocr_resource_label = QLabel("OCR资源: -")
         status_layout.addWidget(self.ocr_resource_label)
@@ -1928,11 +1990,146 @@ class MainWindow(QMainWindow):
         self._view_glossary_layout.addWidget(glossary_group, 1)
         self._view_glossary_layout.addStretch()
 
+        reuse_group = QGroupBox("智能复用")
+        reuse_layout = QVBoxLayout()
+        reuse_layout.setSpacing(self._scale_size(10))
+
+        self.translation_reuse_status_label = QLabel("智能复用缓存管理")
+        try:
+            self.translation_reuse_status_label.setWordWrap(True)
+        except Exception:
+            pass
+        reuse_layout.addWidget(self.translation_reuse_status_label)
+        self.translation_reuse_status_label.hide()
+
+        self.translation_reuse_db_path_label = QLabel("数据库路径: -")
+        try:
+            self.translation_reuse_db_path_label.setWordWrap(True)
+        except Exception:
+            pass
+        reuse_layout.addWidget(self.translation_reuse_db_path_label)
+        self.translation_reuse_db_path_label.hide()
+
+        reuse_toggle_row = QHBoxLayout()
+        self.translation_reuse_enabled_check = QCheckBox("启用智能复用")
+        try:
+            self.translation_reuse_enabled_check.setChecked(
+                bool(self.config_manager.get_bool("translation", "reuse_enabled", True))
+            )
+        except Exception:
+            self.translation_reuse_enabled_check.setChecked(True)
+        self.translation_reuse_enabled_check.stateChanged.connect(self._save_translation_reuse_enabled_setting)
+        reuse_toggle_row.addWidget(self.translation_reuse_enabled_check)
+        reuse_toggle_row.addStretch()
+
+        self.translation_reuse_total_label = QLabel("总共 0 条")
+        reuse_toggle_row.addWidget(self.translation_reuse_total_label, 0, Qt.AlignmentFlag.AlignRight)
+        reuse_layout.addLayout(reuse_toggle_row)
+
+        reuse_search_row = QHBoxLayout()
+        reuse_search_row.addWidget(QLabel("搜索:"))
+        self.translation_reuse_search_edit = QLineEdit()
+        self.translation_reuse_search_edit.setPlaceholderText("按源文、译文或语言代码搜索")
+        self.translation_reuse_search_edit.textChanged.connect(self._on_translation_reuse_search_changed)
+        reuse_search_row.addWidget(self.translation_reuse_search_edit, 1)
+
+        self.translation_reuse_refresh_button = QPushButton("刷新")
+        self.translation_reuse_refresh_button.clicked.connect(lambda: self._refresh_translation_reuse_entries(reset=True))
+        reuse_search_row.addWidget(self.translation_reuse_refresh_button)
+        self.translation_reuse_refresh_button.hide()
+
+        self.translation_reuse_delete_button = QPushButton("删除选中")
+        self.translation_reuse_delete_button.clicked.connect(self._delete_selected_translation_reuse_entries)
+        reuse_search_row.addWidget(self.translation_reuse_delete_button)
+        self.translation_reuse_delete_button.hide()
+        reuse_layout.addLayout(reuse_search_row)
+
+        self.translation_reuse_count_label = QLabel("当前显示 0 条")
+        reuse_layout.addWidget(self.translation_reuse_count_label)
+        self.translation_reuse_count_label.hide()
+
+        self.translation_reuse_table = QTableWidget()
+        self.translation_reuse_table.setColumnCount(6)
+        self.translation_reuse_table.setHorizontalHeaderLabels(["源文", "译文", "源语言", "目标语言", "更新时间", "操作"])
+        try:
+            self.translation_reuse_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.translation_reuse_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+            self.translation_reuse_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            self.translation_reuse_table.setAlternatingRowColors(True)
+            self.translation_reuse_table.setWordWrap(False)
+            self.translation_reuse_table.setTextElideMode(Qt.TextElideMode.ElideNone)
+            self.translation_reuse_table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+            self.translation_reuse_table.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        except Exception:
+            pass
+        try:
+            self.translation_reuse_table.verticalHeader().setVisible(False)
+        except Exception:
+            pass
+        try:
+            header = self.translation_reuse_table.horizontalHeader()
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        except Exception:
+            pass
+        try:
+            self.translation_reuse_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self.translation_reuse_table.customContextMenuRequested.connect(self._show_translation_reuse_context_menu)
+        except Exception:
+            pass
+        try:
+            self.translation_reuse_table.installEventFilter(self)
+            self.translation_reuse_table.verticalScrollBar().valueChanged.connect(self._on_translation_reuse_table_scrolled)
+        except Exception:
+            pass
+        reuse_layout.addWidget(self.translation_reuse_table, 1)
+        try:
+            self.translation_reuse_delete_shortcut = QShortcut(QKeySequence("Delete"), self.translation_reuse_table)
+            self.translation_reuse_delete_shortcut.activated.connect(self._delete_selected_translation_reuse_entries)
+        except Exception:
+            self.translation_reuse_delete_shortcut = None
+
+        reuse_bottom_row = QHBoxLayout()
+        self.translation_reuse_clear_button = QPushButton("清空")
+        self.translation_reuse_clear_button.clicked.connect(self._clear_all_translation_reuse_entries)
+        reuse_bottom_row.addWidget(self.translation_reuse_clear_button, 0, Qt.AlignmentFlag.AlignLeft)
+        reuse_bottom_row.addStretch()
+        reuse_layout.addLayout(reuse_bottom_row)
+
+        reuse_detail_group = QGroupBox("记录详情")
+        reuse_detail_layout = QVBoxLayout()
+        self.translation_reuse_detail_meta_label = QLabel("选中一条缓存记录后可查看完整句子")
+        reuse_detail_layout.addWidget(self.translation_reuse_detail_meta_label)
+
+        reuse_detail_layout.addWidget(QLabel("源文"))
+        self.translation_reuse_source_preview = QTextEdit()
+        self.translation_reuse_source_preview.setReadOnly(True)
+        self.translation_reuse_source_preview.setMinimumHeight(self._scale_size(88))
+        reuse_detail_layout.addWidget(self.translation_reuse_source_preview)
+
+        reuse_detail_layout.addWidget(QLabel("译文"))
+        self.translation_reuse_target_preview = QTextEdit()
+        self.translation_reuse_target_preview.setReadOnly(True)
+        self.translation_reuse_target_preview.setMinimumHeight(self._scale_size(88))
+        reuse_detail_layout.addWidget(self.translation_reuse_target_preview)
+
+        reuse_detail_group.setLayout(reuse_detail_layout)
+        self._view_reuse_layout.addWidget(reuse_group, 2)
+        self._view_reuse_layout.addWidget(reuse_detail_group, 1)
+        reuse_detail_group.hide()
+        reuse_group.setLayout(reuse_layout)
+        self._view_reuse_layout.addStretch()
+
         try:
             self._view_status.hide()
             self._view_history.hide()
             self._view_hook.hide()
             self._view_glossary.hide()
+            self._view_reuse.hide()
         except Exception:
             pass
 
@@ -1998,6 +2195,427 @@ class MainWindow(QMainWindow):
             self._load_glossary_into_editor()
         except Exception:
             pass
+
+    def show_translation_reuse_view(self) -> None:
+        try:
+            self._set_active_view("reuse")
+        except Exception:
+            return
+        try:
+            self._refresh_translation_reuse_entries(reset=True)
+        except Exception:
+            pass
+        try:
+            QTimer.singleShot(0, self._sync_translation_reuse_table_columns)
+        except Exception:
+            pass
+
+    def _save_translation_reuse_enabled_setting(self, state: int) -> None:
+        enabled = bool(int(state) == int(Qt.CheckState.Checked.value))
+        try:
+            self.config_manager.set("translation", "reuse_enabled", "true" if enabled else "false")
+        except Exception:
+            pass
+        try:
+            self.log_message(f"智能复用已{'启用' if enabled else '关闭'}")
+        except Exception:
+            pass
+
+    def _make_translation_reuse_text_cell(self, text: str, row_index: int) -> QPlainTextEdit:
+        editor = QPlainTextEdit()
+        editor.setPlainText(str(text or ""))
+        editor.setReadOnly(True)
+        try:
+            editor.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        except Exception:
+            pass
+        try:
+            editor.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            editor.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        except Exception:
+            pass
+        try:
+            editor.setFrameStyle(QFrame.Shape.NoFrame)
+        except Exception:
+            pass
+        try:
+            editor.setObjectName("translationReuseCell")
+            editor.setStyleSheet(
+                """
+                QPlainTextEdit#translationReuseCell {
+                    background: transparent;
+                    border: 0px;
+                    padding: 2px 4px;
+                }
+                """
+            )
+        except Exception:
+            pass
+        try:
+            editor.setProperty("translation_reuse_row", int(row_index))
+            editor.installEventFilter(self)
+        except Exception:
+            pass
+        return editor
+
+    def _sync_translation_reuse_table_columns(self) -> None:
+        table = getattr(self, "translation_reuse_table", None)
+        if table is None:
+            return
+        try:
+            viewport_width = int(table.viewport().width() or 0)
+        except Exception:
+            viewport_width = 0
+        if viewport_width <= 0:
+            return
+        try:
+            header = table.horizontalHeader()
+            lang_src_w = max(self._scale_size(92), header.sectionSize(2))
+            lang_tgt_w = max(self._scale_size(92), header.sectionSize(3))
+            updated_w = max(self._scale_size(148), header.sectionSize(4))
+            action_w = max(self._scale_size(84), header.sectionSize(5))
+        except Exception:
+            lang_src_w = self._scale_size(92)
+            lang_tgt_w = self._scale_size(92)
+            updated_w = self._scale_size(148)
+            action_w = self._scale_size(84)
+
+        remaining = max(
+            self._scale_size(320),
+            viewport_width - lang_src_w - lang_tgt_w - updated_w - action_w - self._scale_size(16),
+        )
+        src_w = max(self._scale_size(200), int(remaining * 0.5))
+        tgt_w = max(self._scale_size(200), remaining - src_w)
+
+        try:
+            table.setColumnWidth(0, src_w)
+            table.setColumnWidth(1, tgt_w)
+            table.setColumnWidth(2, lang_src_w)
+            table.setColumnWidth(3, lang_tgt_w)
+            table.setColumnWidth(4, updated_w)
+            table.setColumnWidth(5, action_w)
+        except Exception:
+            pass
+
+    def _on_translation_reuse_search_changed(self) -> None:
+        self._refresh_translation_reuse_entries(reset=True)
+
+    def _append_translation_reuse_rows(self, entries: list[dict[str, object]]) -> None:
+        table = getattr(self, "translation_reuse_table", None)
+        if table is None or not entries:
+            return
+
+        start_row = len(self._translation_reuse_entries)
+        self._translation_reuse_entries.extend(list(entries or []))
+        try:
+            table.setRowCount(len(self._translation_reuse_entries))
+        except Exception:
+            pass
+
+        for local_index, entry in enumerate(entries):
+            row_index = start_row + local_index
+            src = str(entry.get("src") or "")
+            tgt = str(entry.get("tgt") or "")
+            src_lang = str(entry.get("source_lang") or "")
+            tgt_lang = str(entry.get("target_lang") or "")
+            updated_at = str(entry.get("updated_at") or entry.get("created_at") or "")
+            try:
+                src_lang = str(display_name_for_key(src_lang) or src_lang)
+            except Exception:
+                pass
+            try:
+                tgt_lang = str(display_name_for_key(tgt_lang) or tgt_lang)
+            except Exception:
+                pass
+
+            src_anchor = QTableWidgetItem("")
+            tgt_anchor = QTableWidgetItem("")
+            try:
+                src_anchor.setData(Qt.ItemDataRole.UserRole, int(entry.get("entry_id") or 0))
+                src_anchor.setToolTip(src)
+            except Exception:
+                pass
+            try:
+                tgt_anchor.setToolTip(tgt)
+            except Exception:
+                pass
+            try:
+                table.setItem(row_index, 0, src_anchor)
+                table.setItem(row_index, 1, tgt_anchor)
+                table.setCellWidget(row_index, 0, self._make_translation_reuse_text_cell(src, row_index))
+                table.setCellWidget(row_index, 1, self._make_translation_reuse_text_cell(tgt, row_index))
+            except Exception:
+                pass
+
+            plain_items = [
+                QTableWidgetItem(src_lang),
+                QTableWidgetItem(tgt_lang),
+                QTableWidgetItem(updated_at),
+            ]
+            for offset, item in enumerate(plain_items, start=2):
+                try:
+                    item.setToolTip(str(item.text() or ""))
+                except Exception:
+                    pass
+                try:
+                    table.setItem(row_index, offset, item)
+                except Exception:
+                    pass
+            try:
+                delete_button = QPushButton("删除")
+                delete_button.clicked.connect(
+                    lambda _checked=False, entry_id=int(entry.get("entry_id") or 0): self._delete_translation_reuse_entry(entry_id)
+                )
+                table.setCellWidget(row_index, 5, delete_button)
+            except Exception:
+                pass
+            try:
+                table.setRowHeight(row_index, self._scale_size(62))
+            except Exception:
+                pass
+
+        try:
+            table.resizeColumnToContents(2)
+            table.resizeColumnToContents(3)
+            table.resizeColumnToContents(4)
+        except Exception:
+            pass
+        self._sync_translation_reuse_table_columns()
+
+    def _refresh_translation_reuse_entries(self, *, reset: bool = True) -> None:
+        if self._translation_reuse_loading:
+            return
+
+        cache = self._get_translation_reuse_cache(force=True)
+        query = ""
+        try:
+            query = str(self.translation_reuse_search_edit.text() or "").strip()
+        except Exception:
+            query = ""
+        total_count = 0
+        if cache is not None:
+            try:
+                total_count = int(cache.count_entries(query=query))
+            except Exception:
+                total_count = 0
+        try:
+            if query:
+                self.translation_reuse_total_label.setText(f"匹配 {total_count} 条")
+            else:
+                self.translation_reuse_total_label.setText(f"总共 {total_count} 条")
+        except Exception:
+            pass
+
+        table = getattr(self, "translation_reuse_table", None)
+        if table is None:
+            return
+
+        if reset:
+            self._translation_reuse_last_query = query
+            self._translation_reuse_next_offset = 0
+            self._translation_reuse_has_more = True
+            self._translation_reuse_entries = []
+            try:
+                table.setRowCount(0)
+            except Exception:
+                pass
+        elif query != getattr(self, "_translation_reuse_last_query", ""):
+            self._refresh_translation_reuse_entries(reset=True)
+            return
+
+        if cache is None or not self._translation_reuse_has_more:
+            return
+
+        self._translation_reuse_loading = True
+        try:
+            try:
+                page_size = int(getattr(self, "_translation_reuse_page_size", 500) or 500)
+            except Exception:
+                page_size = 500
+
+            try:
+                rows = cache.list_entries(
+                    query=query,
+                    limit=page_size,
+                    offset=int(self._translation_reuse_next_offset or 0),
+                )
+            except Exception:
+                rows = []
+
+            self._append_translation_reuse_rows(list(rows or []))
+            try:
+                self._translation_reuse_next_offset += len(rows or [])
+            except Exception:
+                self._translation_reuse_next_offset = len(self._translation_reuse_entries)
+            self._translation_reuse_has_more = len(rows or []) >= page_size
+        finally:
+            self._translation_reuse_loading = False
+
+    def _on_translation_reuse_table_scrolled(self, value: int) -> None:
+        table = getattr(self, "translation_reuse_table", None)
+        if table is None:
+            return
+        try:
+            bar = table.verticalScrollBar()
+        except Exception:
+            return
+        try:
+            if int(value) >= int(bar.maximum()) - 8:
+                self._refresh_translation_reuse_entries(reset=False)
+        except Exception:
+            pass
+
+    def _show_translation_reuse_context_menu(self, pos) -> None:
+        table = getattr(self, "translation_reuse_table", None)
+        if table is None:
+            return
+        menu = QMenu(table)
+        delete_action = menu.addAction("删除选中")
+        refresh_action = menu.addAction("刷新列表")
+        chosen = menu.exec(table.viewport().mapToGlobal(pos))
+        if chosen is delete_action:
+            self._delete_selected_translation_reuse_entries()
+        elif chosen is refresh_action:
+            self._refresh_translation_reuse_entries(reset=True)
+
+    def _delete_translation_reuse_entry(self, entry_id: int) -> None:
+        try:
+            target_id = int(entry_id)
+        except Exception:
+            target_id = 0
+        if target_id <= 0:
+            return
+
+        cache = self._get_translation_reuse_cache(force=True)
+        if cache is None:
+            QMessageBox.warning(self, "删除失败", "缓存数据库尚未初始化。")
+            return
+
+        deleted = False
+        try:
+            deleted = bool(cache.delete_entry(target_id))
+        except Exception:
+            deleted = False
+        if not deleted:
+            QMessageBox.warning(self, "删除失败", "未删除该条缓存记录，请查看控制台错误信息。")
+            return
+
+        try:
+            self.log_message(f"已删除 1 条智能复用缓存记录 (id={target_id})")
+        except Exception:
+            pass
+        self._refresh_translation_reuse_entries(reset=True)
+
+    def _delete_selected_translation_reuse_entries(self) -> None:
+        table = getattr(self, "translation_reuse_table", None)
+        if table is None:
+            return
+        try:
+            indexes = table.selectionModel().selectedRows()
+        except Exception:
+            indexes = []
+        if not indexes:
+            QMessageBox.information(self, "未选择记录", "请先选择要删除的缓存记录。")
+            return
+
+        ids: list[int] = []
+        for index in indexes:
+            try:
+                row = int(index.row())
+            except Exception:
+                continue
+            if row < 0 or row >= len(self._translation_reuse_entries):
+                continue
+            try:
+                ids.append(int(self._translation_reuse_entries[row].get("entry_id") or 0))
+            except Exception:
+                continue
+        ids = [x for x in ids if int(x) > 0]
+        if not ids:
+            QMessageBox.warning(self, "删除失败", "未能读取所选缓存记录的编号。")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定要删除选中的 {len(ids)} 条智能复用缓存记录吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        cache = self._get_translation_reuse_cache(force=True)
+        if cache is None:
+            QMessageBox.warning(self, "删除失败", "缓存数据库尚未初始化。")
+            return
+
+        deleted = 0
+        try:
+            deleted = int(cache.delete_entries(ids))
+        except Exception:
+            deleted = 0
+        if deleted <= 0:
+            QMessageBox.warning(self, "删除失败", "未删除任何缓存记录，请查看控制台错误信息。")
+            return
+
+        try:
+            self.log_message(f"已删除 {deleted} 条智能复用缓存记录")
+        except Exception:
+            pass
+        self._refresh_translation_reuse_entries(reset=True)
+
+    def _clear_all_translation_reuse_entries(self) -> None:
+        cache = self._get_translation_reuse_cache(force=True)
+        if cache is None:
+            QMessageBox.warning(self, "清空失败", "缓存数据库尚未初始化。")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认清空",
+            "确定要清空全部智能复用缓存记录吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        cleared = 0
+        try:
+            cleared = int(cache.clear_entries())
+        except Exception:
+            cleared = 0
+
+        try:
+            self.log_message(f"已清空智能复用缓存记录 {cleared} 条")
+        except Exception:
+            pass
+        self._refresh_translation_reuse_entries(reset=True)
+
+    def eventFilter(self, watched, event):
+        try:
+            table = getattr(self, "translation_reuse_table", None)
+        except Exception:
+            table = None
+        try:
+            if table is not None and watched is table and event.type() == QEvent.Type.Resize:
+                try:
+                    QTimer.singleShot(0, self._sync_translation_reuse_table_columns)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            row_value = watched.property("translation_reuse_row") if watched is not None else None
+        except Exception:
+            row_value = None
+        try:
+            if table is not None and row_value is not None and event.type() == QEvent.Type.MouseButtonPress:
+                table.selectRow(int(row_value))
+        except Exception:
+            pass
+        return super().eventFilter(watched, event)
 
     def _get_glossary_raw(self) -> str:
         try:
@@ -2158,7 +2776,7 @@ class MainWindow(QMainWindow):
 
     def _set_active_view(self, view: str) -> None:
         v = (view or "").strip().lower()
-        if v not in ("main", "system_status", "history", "hook", "glossary"):
+        if v not in ("main", "system_status", "history", "hook", "glossary", "reuse"):
             v = "main"
 
         try:
@@ -2181,6 +2799,10 @@ class MainWindow(QMainWindow):
             self._view_glossary.setVisible(v == "glossary")
         except Exception:
             pass
+        try:
+            self._view_reuse.setVisible(v == "reuse")
+        except Exception:
+            pass
 
         try:
             act = self._hero_menu_actions.get("main")
@@ -2195,6 +2817,9 @@ class MainWindow(QMainWindow):
             act = self._hero_menu_actions.get("glossary")
             if act is not None:
                 act.setChecked(v == "glossary")
+            act = self._hero_menu_actions.get("reuse")
+            if act is not None:
+                act.setChecked(v == "reuse")
         except Exception:
             pass
 
@@ -2289,6 +2914,33 @@ class MainWindow(QMainWindow):
             }
             #mainRoot QTextEdit {
                 padding: 10px;
+            }
+
+            #mainRoot QTableWidget {
+                background-color: rgba(255, 255, 255, 0.96);
+                border: 1px solid rgba(17, 24, 39, 0.10);
+                border-radius: 12px;
+                gridline-color: rgba(17, 24, 39, 0.06);
+                alternate-background-color: rgba(238, 242, 255, 0.35);
+                selection-background-color: #DBEAFE;
+                selection-color: #111827;
+            }
+            #mainRoot QTableWidget::item {
+                padding: 8px 10px;
+                border: 0px;
+            }
+            #mainRoot QHeaderView::section {
+                background-color: rgba(238, 242, 255, 0.82);
+                color: rgba(17, 24, 39, 0.72);
+                border: 0px;
+                border-bottom: 1px solid rgba(17, 24, 39, 0.08);
+                padding: 8px 10px;
+                font-weight: 600;
+            }
+            #mainRoot QTableCornerButton::section {
+                background-color: rgba(238, 242, 255, 0.82);
+                border: 0px;
+                border-bottom: 1px solid rgba(17, 24, 39, 0.08);
             }
 
             #mainRoot QComboBox::drop-down {
@@ -2391,6 +3043,9 @@ class MainWindow(QMainWindow):
                 "save_button",
                 "about_button",
                 "quit_button",
+                "translation_reuse_refresh_button",
+                "translation_reuse_delete_button",
+                "translation_reuse_clear_button",
                 "shortcut_btn",
             ):
                 w = getattr(self, name, None)
@@ -2444,6 +3099,44 @@ class MainWindow(QMainWindow):
         self.hotkey_manager.set_hotkey(parsed)
         self.update_translate_button_label()
 
+    def _detect_local_model_dir(self, model_path: str | None) -> Path | None:
+        candidates: list[Path] = []
+        if model_path:
+            try:
+                candidates.append(Path(model_path))
+            except Exception:
+                pass
+        else:
+            try:
+                current_dir = Path(__file__).resolve().parent.parent.parent
+                candidates.append(current_dir / "models")
+            except Exception:
+                pass
+            try:
+                if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+                    candidates.append(Path(sys._MEIPASS) / "models")
+            except Exception:
+                pass
+            try:
+                if getattr(sys, "frozen", False):
+                    candidates.append(Path(sys.executable).parent / "models")
+            except Exception:
+                pass
+
+        for cand in candidates:
+            try:
+                if cand.exists() and (cand / "config.json").exists():
+                    if (cand / "pytorch_model.bin").exists() or (cand / "pytorch_model.bin.index.json").exists():
+                        return cand
+                    try:
+                        if any(cand.glob("*.safetensors")):
+                            return cand
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+        return None
+
     def begin_async_components_init(self, *, model_path: str | None = None) -> None:
         """
         异步初始化 OCR + 模型（窗口已显示后调用）。
@@ -2457,8 +3150,32 @@ class MainWindow(QMainWindow):
             return
 
         self._model_path_for_init = model_path
-        self._init_progress_text = "开始初始化"
+        self._init_progress_text = "翻译器正在初始化…"
         self._component_stats = {"tesseract": {}, "ocr": {}, "translator": {}}
+        self._local_model_missing = False
+        resolved_model_dir = self._detect_local_model_dir(model_path)
+        if resolved_model_dir is None:
+            self._local_model_missing = True
+            self._init_progress_text = "未检测到本地模型"
+            try:
+                self._apply_api_service_ui_state()
+            except Exception:
+                pass
+            if not bool(getattr(self, "_api_enabled", False)):
+                try:
+                    self._set_api_service_enabled(True)
+                except Exception:
+                    self._api_enabled = True
+                    try:
+                        self._apply_api_service_ui_state()
+                    except Exception:
+                        pass
+        elif model_path is None:
+            try:
+                model_path = str(resolved_model_dir)
+                self._model_path_for_init = model_path
+            except Exception:
+                pass
 
         self.translate_button.setEnabled(False)
         try:
@@ -2475,7 +3192,7 @@ class MainWindow(QMainWindow):
             config_manager=self.config_manager,
             tesseract_manager=self.tesseract_manager,
             model_path=model_path,
-            skip_translator=bool(self._api_enabled),
+            skip_translator=bool(self._api_enabled) or bool(self._local_model_missing),
         )
         self._async_init_thread = th
         th.progress.connect(self._on_init_progress)
@@ -2497,7 +3214,11 @@ class MainWindow(QMainWindow):
         return bool(self.ocr_processor) and bool(self.translator)
 
     def _on_init_progress(self, msg: str) -> None:
-        self._init_progress_text = str(msg or "").strip() or "初始化中"
+        raw_msg = str(msg or "").strip()
+        if raw_msg and ("失败" in raw_msg or "error" in raw_msg.lower()):
+            self._init_progress_text = raw_msg
+        else:
+            self._init_progress_text = "翻译器正在初始化…"
         try:
             self.update_translate_button_label()
         except Exception:
@@ -2620,6 +3341,26 @@ class MainWindow(QMainWindow):
             pass
         self._refresh_system_status()
 
+    def _get_local_model_device_suffix(self) -> str:
+        device = ""
+        try:
+            device = str(getattr(self.translator, "device", "") or "").strip().lower()
+        except Exception:
+            device = ""
+        if not device:
+            try:
+                stats = self._component_stats.get("translator", {}) or {}
+                device = str(stats.get("device") or "").strip().lower()
+            except Exception:
+                device = ""
+        if not device:
+            try:
+                use_cpu = bool(self.config_manager.get_bool("local_model", "use_cpu", False))
+            except Exception:
+                use_cpu = False
+            device = "cpu" if use_cpu else "cuda"
+        return f"（{device}）" if device else ""
+
     def _refresh_system_status(self) -> None:
         """
         每秒刷新一次（以及进度/完成时触发）：
@@ -2677,7 +3418,7 @@ class MainWindow(QMainWindow):
             if self.ocr_processor:
                 self.ocr_status_label.setText("OCR: 就绪")
             else:
-                self.ocr_status_label.setText(f"OCR: {self._init_progress_text or '初始化中…'}")
+                self.ocr_status_label.setText("OCR: 初始化中…")
         except Exception:
             pass
 
@@ -2691,12 +3432,14 @@ class MainWindow(QMainWindow):
 
         # 模型状态
         try:
-            if not bool(getattr(self, "_api_enabled", False)):
+            device_suffix = self._get_local_model_device_suffix()
+            if bool(getattr(self, "_local_model_missing", False)):
+                self.model_status_label.setText("模型: 不可用")
+            elif not bool(getattr(self, "_api_enabled", False)):
                 if self.translator:
-                    device = getattr(self.translator, "device", None) or "-"
-                    self.model_status_label.setText(f"模型: 就绪（{device}）")
+                    self.model_status_label.setText(f"模型: 可用{device_suffix}")
                 else:
-                    self.model_status_label.setText(f"模型: {self._init_progress_text or '初始化中…'}")
+                    self.model_status_label.setText("模型: 不可用")
         except Exception:
             pass
 
@@ -2719,18 +3462,23 @@ class MainWindow(QMainWindow):
             pass
 
         try:
-            if not bool(getattr(self, "_api_enabled", False)):
-                tstats = self._component_stats.get("translator", {}) or {}
-                rss_d = tstats.get("rss_delta_bytes")
-                rss_s = (rm.format_bytes(rss_d) if (rm is not None and rss_d) else "-")
-                if gs is None or not getattr(gs, "available", False):
-                    self.model_resource_label.setText(f"模型资源: 内存Δ {rss_s} | CPU {cpu_now}")
+            if bool(getattr(self, "_local_model_missing", False)):
+                self.model_resource_label.setText("模型资源: 不可用")
+            elif not bool(getattr(self, "_api_enabled", False)):
+                if not self.translator:
+                    self.model_resource_label.setText("模型资源: 不可用")
                 else:
-                    ga = tstats.get("gpu_allocated_delta_bytes")
-                    gr = tstats.get("gpu_reserved_delta_bytes")
-                    ga_s = (rm.format_bytes(ga) if (rm is not None and ga) else "-")
-                    gr_s = (rm.format_bytes(gr) if (rm is not None and gr) else "-")
-                    self.model_resource_label.setText(f"模型资源: 内存Δ {rss_s} | 显存Δ {ga_s} 已分配 / {gr_s} 已保留")
+                    tstats = self._component_stats.get("translator", {}) or {}
+                    rss_d = tstats.get("rss_delta_bytes")
+                    rss_s = (rm.format_bytes(rss_d) if (rm is not None and rss_d) else "-")
+                    if gs is None or not getattr(gs, "available", False):
+                        self.model_resource_label.setText(f"模型资源: 内存Δ {rss_s} | CPU {cpu_now}")
+                    else:
+                        ga = tstats.get("gpu_allocated_delta_bytes")
+                        gr = tstats.get("gpu_reserved_delta_bytes")
+                        ga_s = (rm.format_bytes(ga) if (rm is not None and ga) else "-")
+                        gr_s = (rm.format_bytes(gr) if (rm is not None and gr) else "-")
+                        self.model_resource_label.setText(f"模型资源: 内存Δ {rss_s} | 显存Δ {ga_s} 已分配 / {gr_s} 已保留")
         except Exception:
             pass
 
@@ -2754,7 +3502,12 @@ class MainWindow(QMainWindow):
                 return
         if not self._components_ready_for_work():
             hint = self._init_progress_text or "初始化中"
-            self.translate_button.setText(f"初始化中… ({hint}) (快捷键: {hotkey})")
+            if bool(getattr(self, "_local_model_missing", False)):
+                self.translate_button.setText(f"未检测到本地模型 (快捷键: {hotkey})")
+            elif "失败" in hint:
+                self.translate_button.setText(f"{hint} (快捷键: {hotkey})")
+            else:
+                self.translate_button.setText("翻译器正在初始化…")
             try:
                 self.translate_button.setEnabled(False)
             except Exception:
@@ -5228,6 +5981,35 @@ class MainWindow(QMainWindow):
         """
 
 
+    def _get_translation_reuse_cache(self, *, force: bool = False) -> TranslationReuseCache | None:
+        try:
+            enabled = self.config_manager.get_bool("translation", "reuse_enabled", True)
+        except Exception:
+            enabled = True
+        if (not force) and (not enabled):
+            return None
+
+        cache = getattr(self, "_translation_reuse_cache", None)
+        if cache is not None:
+            return cache
+
+        try:
+            raw_path = str(self.config_manager.get("translation", "reuse_db_path", "config/translation_reuse.db") or "").strip()
+        except Exception:
+            raw_path = "config/translation_reuse.db"
+        if not raw_path:
+            raw_path = "config/translation_reuse.db"
+
+        try:
+            db_path = Path(raw_path)
+            if not db_path.is_absolute():
+                db_path = Path(self.config_manager.app_dir) / db_path
+            cache = TranslationReuseCache(db_path)
+            self._translation_reuse_cache = cache
+            return cache
+        except Exception:
+            return None
+
     def _start_async_translation(
         self,
         *,
@@ -5281,7 +6063,10 @@ class MainWindow(QMainWindow):
             target_lang=target_lang,
             disable_preprocess=bool(disable_preprocess),
             translator=self.translator,
+            model_path=getattr(self, "_model_path_for_init", None),
             glossary_entries=glossary_entries,
+            reuse_enabled=bool(self.config_manager.get_bool("translation", "reuse_enabled", True)),
+            reuse_cache=self._get_translation_reuse_cache(),
         )
 
         self._translation_thread = th
@@ -6220,13 +7005,15 @@ class MainWindow(QMainWindow):
 
         try:
             if hasattr(self, "model_status_label") and self.model_status_label is not None:
-                self.model_status_label.setVisible(not bool(self._api_enabled))
+                show_model_status = (not bool(self._api_enabled)) or bool(getattr(self, "_local_model_missing", False))
+                self.model_status_label.setVisible(show_model_status)
         except Exception:
             pass
 
         try:
             if hasattr(self, "model_resource_label") and self.model_resource_label is not None:
-                self.model_resource_label.setVisible(not bool(self._api_enabled))
+                show_model_resource = (not bool(self._api_enabled)) and (not bool(getattr(self, "_local_model_missing", False)))
+                self.model_resource_label.setVisible(show_model_resource)
         except Exception:
             pass
 

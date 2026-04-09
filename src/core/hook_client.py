@@ -183,6 +183,8 @@ class HookTextThread(QThread):
         self._frida_thread = None
         self._frida_stop = threading.Event()
         self._agent_process = None
+        self._renpy_target_detected = False
+        self._renpy_detection_reason = ""
         self._enable_renpy_injection = self._resolve_renpy_injection_enabled()
 
     @staticmethod
@@ -229,7 +231,226 @@ class HookTextThread(QThread):
                 enabled = self._parse_bool(env, enabled)
         except Exception:
             pass
-        return bool(enabled)
+        if not bool(enabled):
+            self._renpy_target_detected = False
+            self._renpy_detection_reason = "disabled_by_setting"
+            return False
+
+        detected, reason = self._detect_renpy_target()
+        self._renpy_target_detected = bool(detected)
+        self._renpy_detection_reason = str(reason or "")
+        try:
+            hook_log(
+                "Hook Ren'Py auto-detect: "
+                f"enabled={bool(detected)} reason={self._renpy_detection_reason or 'unknown'}"
+            )
+        except Exception:
+            pass
+        return bool(detected)
+
+    def _query_process_exe_fallback(self, pid: int) -> str:
+        if int(pid or 0) <= 0 or os.name != "nt":
+            return ""
+        try:
+            import ctypes
+            import ctypes.wintypes as wt
+        except Exception:
+            return ""
+        try:
+            k32 = ctypes.windll.kernel32
+            OpenProcess = k32.OpenProcess
+            CloseHandle = k32.CloseHandle
+            QueryFullProcessImageNameW = getattr(k32, "QueryFullProcessImageNameW", None)
+            if QueryFullProcessImageNameW is None:
+                return ""
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+            OpenProcess.restype = wt.HANDLE
+            CloseHandle.argtypes = [wt.HANDLE]
+            CloseHandle.restype = wt.BOOL
+            QueryFullProcessImageNameW.argtypes = [wt.HANDLE, wt.DWORD, wt.LPWSTR, ctypes.POINTER(wt.DWORD)]
+            QueryFullProcessImageNameW.restype = wt.BOOL
+            handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, wt.DWORD(int(pid)))
+            handle_value = int(getattr(handle, "value", handle) or 0)
+            if not handle_value:
+                return ""
+            try:
+                size = wt.DWORD(32768)
+                buf = ctypes.create_unicode_buffer(size.value)
+                if bool(QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))):
+                    return str(buf.value or "")
+            finally:
+                try:
+                    CloseHandle(handle)
+                except Exception:
+                    pass
+        except Exception:
+            return ""
+        return ""
+
+    def _collect_process_snapshot(self) -> dict[str, object]:
+        info: dict[str, object] = {
+            "name": "",
+            "exe": "",
+            "cwd": "",
+            "cmdline": [],
+            "modules": [],
+        }
+        pid = int(self._pid or 0)
+        if pid <= 0:
+            return info
+
+        proc = None
+        try:
+            import psutil
+
+            proc = psutil.Process(pid)
+        except Exception:
+            proc = None
+
+        if proc is not None:
+            try:
+                info["name"] = str(proc.name() or "")
+            except Exception:
+                pass
+            try:
+                info["exe"] = str(proc.exe() or "")
+            except Exception:
+                pass
+            try:
+                info["cwd"] = str(proc.cwd() or "")
+            except Exception:
+                pass
+            try:
+                cmdline = proc.cmdline()
+                info["cmdline"] = [str(x or "") for x in cmdline if str(x or "").strip()]
+            except Exception:
+                pass
+            try:
+                markers = {"_renpy.pyd", "_renpybidi.pyd", "renpysound.pyd"}
+                seen_modules: set[str] = set()
+                matched_modules: list[str] = []
+                for mm in proc.memory_maps(grouped=False):
+                    try:
+                        path = str(getattr(mm, "path", "") or "")
+                    except Exception:
+                        path = ""
+                    if not path:
+                        continue
+                    low = path.lower().replace("\\", "/")
+                    base = os.path.basename(low)
+                    if base in markers or "/renpy/" in low:
+                        if low in seen_modules:
+                            continue
+                        seen_modules.add(low)
+                        matched_modules.append(path)
+                        if len(matched_modules) >= 16:
+                            break
+                info["modules"] = matched_modules
+            except Exception:
+                pass
+
+        if not str(info.get("exe") or "").strip():
+            info["exe"] = self._query_process_exe_fallback(pid)
+        if not str(info.get("name") or "").strip():
+            try:
+                info["name"] = os.path.basename(str(info.get("exe") or "").strip())
+            except Exception:
+                pass
+        return info
+
+    def _detect_renpy_target(self) -> tuple[bool, str]:
+        try:
+            from pathlib import Path
+        except Exception:
+            Path = None
+
+        info = self._collect_process_snapshot()
+        renpy_modules = {"_renpy.pyd", "_renpybidi.pyd", "renpysound.pyd"}
+        for raw in info.get("modules", []) or []:
+            try:
+                path = str(raw or "")
+            except Exception:
+                path = ""
+            if not path:
+                continue
+            low = path.lower().replace("\\", "/")
+            base = os.path.basename(low)
+            if base in renpy_modules:
+                return True, f"module:{base}"
+            if "/renpy/" in low:
+                return True, f"module_path:{base}"
+
+        textual_hints = []
+        try:
+            textual_hints.extend(list(info.get("cmdline", []) or []))
+        except Exception:
+            pass
+        textual_hints.extend([info.get("name", ""), info.get("exe", ""), info.get("cwd", "")])
+        for raw in textual_hints:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            low = text.lower().replace("\\", "/")
+            if "/renpy/" in low or low.endswith("/renpy") or low.endswith("renpy.exe"):
+                return True, "path_hint:renpy"
+
+        if Path is None:
+            name = str(info.get("name") or "").strip()
+            return False, f"no_renpy_markers:{name or 'unknown'}"
+
+        candidate_dirs: list[Path] = []
+        seen_dirs: set[str] = set()
+        for raw in (info.get("exe", ""), info.get("cwd", "")):
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            try:
+                path = Path(text).resolve()
+            except Exception:
+                try:
+                    path = Path(text)
+                except Exception:
+                    continue
+            base_dir = path if path.is_dir() else path.parent
+            for root in (base_dir, base_dir.parent):
+                if root is None:
+                    continue
+                key = str(root)
+                if not key or key in seen_dirs:
+                    continue
+                seen_dirs.add(key)
+                candidate_dirs.append(root)
+
+        for root in candidate_dirs:
+            try:
+                renpy_dir = root / "renpy"
+                game_dir = root / "game"
+                if renpy_dir.is_dir() and game_dir.is_dir():
+                    return True, f"layout:{root.name}:renpy+game"
+                if renpy_dir.is_dir() and ((renpy_dir / "common").exists() or (renpy_dir / "__init__.py").exists()):
+                    return True, f"layout:{root.name}:renpy_dir"
+            except Exception:
+                pass
+            try:
+                lib_dir = root / "lib"
+                if not lib_dir.is_dir():
+                    continue
+                for child in lib_dir.iterdir():
+                    child_name = child.name.lower()
+                    if child.is_dir() and (child / "renpy").is_dir():
+                        return True, f"layout:{child.name}:lib_renpy"
+                    if child.is_file() and child_name in renpy_modules:
+                        return True, f"layout:{child.name}"
+                    if child.is_dir():
+                        for marker in renpy_modules:
+                            if (child / marker).exists():
+                                return True, f"layout:{child.name}/{marker}"
+            except Exception:
+                pass
+
+        name = str(info.get("name") or "").strip()
+        return False, f"no_renpy_markers:{name or 'unknown'}"
 
     def _find_32bit_agent(self) -> str | None:
         # Base candidates relative to CWD
@@ -877,6 +1098,16 @@ class HookTextThread(QThread):
         try:
             mode = "ENABLED" if bool(self._enable_renpy_injection) else "DISABLED"
             self.status.emit(f"Hook Ren'Py injection mode: {mode}")
+        except Exception:
+            pass
+        try:
+            reason = str(getattr(self, "_renpy_detection_reason", "") or "")
+            if reason == "disabled_by_setting":
+                self.status.emit("Hook Ren'Py 自动识别: 已被配置禁用")
+            elif bool(self._enable_renpy_injection):
+                self.status.emit("Hook Ren'Py 自动识别: 命中 Ren'Py 目标，启用专用注入")
+            else:
+                self.status.emit("Hook Ren'Py 自动识别: 非 Ren'Py 目标，使用通用 Frida hooks")
         except Exception:
             pass
 
@@ -4374,4 +4605,3 @@ class HookTextThread(QThread):
                         pass
             except Exception:
                 pass
-

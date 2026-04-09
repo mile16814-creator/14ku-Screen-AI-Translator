@@ -20,7 +20,6 @@ import numpy as np
 from PIL import Image
 import pytesseract
 import math
-
 # PyQt6 导入
 from PyQt6.QtCore import QThread, pyqtSignal
 

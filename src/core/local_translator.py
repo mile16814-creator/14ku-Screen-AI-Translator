@@ -822,7 +822,11 @@ class LocalTranslationThread(QThread):
             self.translator = translator
         else:
             # 仅在translator未提供时才创建新实例（不推荐，会导致重复加载）
-            self.translator = LocalAITranslator(model_path) if model_path else LocalAITranslator()
+            self.translator = (
+                LocalAITranslator(model_path, load_model_immediately=False)
+                if model_path
+                else LocalAITranslator(load_model_immediately=False)
+            )
         self.results: List[TranslationResult] = []
     
     def run(self):
