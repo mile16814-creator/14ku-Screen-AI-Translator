@@ -9,13 +9,13 @@
 #define MyAppPublisher "14ku"
 #define MyAppURL "https://14ku.date"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.0.0"
+  #error "MyAppVersion must be provided by build_installer.ps1."
 #endif
 #ifndef AppArch
   #define AppArch "x64"
 #endif
 #ifndef SourceDir
-  #define SourceDir "..\dist\ScreenTranslator"
+  #define SourceDir "..\dist\ScreenTranslator-x64"
 #endif
 #ifndef DualBuild
   #define DualBuild "0"
@@ -25,6 +25,9 @@
 #endif
 #ifndef SourceDirX64
   #define SourceDirX64 "..\dist\ScreenTranslator-x64"
+#endif
+#ifndef LzmaThreads
+  #define LzmaThreads "1"
 #endif
 
 ; Prefer a source icon if present; otherwise use the icon bundled in the PyInstaller dist output.
@@ -54,6 +57,8 @@ OutputBaseFilename=ScreenTranslator_Setup_{#MyAppVersion}
 SetupIconFile={#MySetupIcon}
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2
+LZMANumBlockThreads={#LzmaThreads}
+LZMAUseSeparateProcess=yes
 SolidCompression=yes
 WizardStyle=modern
 #if DualBuild == "1"
@@ -65,11 +70,8 @@ ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
 #endif
 
-; ---- Large installer support (> ~4.2GB) ----
-; When the payload is larger than what Windows supports for a single Setup.exe,
-; Inno Setup requires Disk Spanning. This generates:
-;   ScreenTranslator_Setup_x.y.z.exe + ScreenTranslator_Setup_x.y.z-*.bin
-; Keep all files in the same folder when distributing/running the installer.
+; 单文件安装包：不生成 .bin 分卷，只输出一个 .exe
+; 若安装包超过约 4GB 可能失败，届时需减小体积或启用 DiskSpanning
 DiskSpanning=no
 
 [Languages]

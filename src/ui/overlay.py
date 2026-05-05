@@ -41,6 +41,7 @@ class TranslationOverlay(QWidget):
         self.text_color = "#FFFFFF"
         self.hide_timer = QTimer()
         self.hide_timer.timeout.connect(self.hide_overlay)
+        self._accent_mode = "default"
         
         # 初始化UI
         self.init_ui()
@@ -128,6 +129,7 @@ class TranslationOverlay(QWidget):
         
         # 2. 原文区域
         original_group = QFrame()
+        self.original_group = original_group
         original_group.setStyleSheet("""
             QFrame {
                 background-color: rgba(40, 40, 40, 180);
@@ -138,10 +140,12 @@ class TranslationOverlay(QWidget):
         """)
         
         original_layout = QVBoxLayout(original_group)
+        self.original_title = None
         
         original_title = QLabel("原文")
         original_title.setStyleSheet("color: #888888; font-size: 10px;")
         original_layout.addWidget(original_title)
+        self.original_title = original_title
         
         # 原文文本框（可编辑）
         self.original_text = QTextEdit()
@@ -165,6 +169,7 @@ class TranslationOverlay(QWidget):
         
         # 3. 翻译结果区域
         translation_group = QFrame()
+        self.translation_group = translation_group
         translation_group.setStyleSheet("""
             QFrame {
                 background-color: rgba(50, 50, 50, 180);
@@ -175,10 +180,12 @@ class TranslationOverlay(QWidget):
         """)
         
         translation_layout = QVBoxLayout(translation_group)
+        self.translation_title = None
         
         translation_title = QLabel("翻译")
         translation_title.setStyleSheet("color: #888888; font-size: 10px;")
         translation_layout.addWidget(translation_title)
+        self.translation_title = translation_title
         
         # 进度条容器（翻译过程中显示）
         self.progress_container = QFrame()
@@ -297,6 +304,45 @@ class TranslationOverlay(QWidget):
         self.setLayout(QVBoxLayout())
         self.layout().addWidget(self.main_frame)
         self.layout().setContentsMargins(0, 0, 0, 0)
+        self._apply_accent_mode("default")
+
+    def _apply_accent_mode(self, mode: str) -> None:
+        """Apply the default or hook accent palette."""
+        mode = "hook" if str(mode or "").strip().lower() == "hook" else "default"
+        self._accent_mode = mode
+        if mode == "hook":
+            self.title_label.setStyleSheet("color: #4DA3FF;")
+            self.language_label.setStyleSheet("color: #9FC8FF; font-size: 10px;")
+            self.translation_group.setStyleSheet("""
+                QFrame {
+                    background-color: rgba(25, 42, 68, 210);
+                    border: 1px solid rgba(77, 163, 255, 190);
+                    border-radius: 5px;
+                    padding: 5px;
+                }
+            """)
+            if self.translation_title is not None:
+                self.translation_title.setStyleSheet("color: #9FC8FF; font-size: 10px;")
+        else:
+            self.title_label.setStyleSheet("color: #4CAF50;")
+            self.language_label.setStyleSheet("color: #888888; font-size: 10px;")
+            self.translation_group.setStyleSheet("""
+                QFrame {
+                    background-color: rgba(50, 50, 50, 180);
+                    border: 1px solid rgba(100, 100, 100, 150);
+                    border-radius: 5px;
+                    padding: 5px;
+                }
+            """)
+            if self.translation_title is not None:
+                self.translation_title.setStyleSheet("color: #888888; font-size: 10px;")
+        if hasattr(self, "translation_text") and self.translation_text is not None:
+            self._apply_translation_text_style()
+
+    def set_hook_context(self, source_lang: str, target_lang: str) -> None:
+        """Apply hook styling and show the active language pair."""
+        self._apply_accent_mode("hook")
+        self.language_label.setText(f"{source_lang} → {target_lang}")
 
     def _apply_translation_text_style(self):
         """根据当前设置应用翻译文本样式（用于动态更新颜色等）。"""
@@ -306,15 +352,27 @@ class TranslationOverlay(QWidget):
                 c = QColor("#FFFFFF")
         except Exception:
             c = QColor("#FFFFFF")
-        self.translation_text.setStyleSheet(f"""
-            QTextEdit {{
-                background: transparent;
-                color: {c.name().upper()};
-                font-size: 12px;
-                font-weight: bold;
-                border: none;
-            }}
-        """)
+        if getattr(self, "_accent_mode", "default") == "hook":
+            self.translation_text.setStyleSheet(f"""
+                QTextEdit {{
+                    background: rgba(13, 26, 44, 110);
+                    color: {c.name().upper()};
+                    font-size: 12px;
+                    font-weight: bold;
+                    border: 1px solid rgba(77, 163, 255, 150);
+                    border-radius: 3px;
+                }}
+            """)
+        else:
+            self.translation_text.setStyleSheet(f"""
+                QTextEdit {{
+                    background: transparent;
+                    color: {c.name().upper()};
+                    font-size: 12px;
+                    font-weight: bold;
+                    border: none;
+                }}
+            """)
 
     def set_text_color(self, color: str):
         """设置翻译文字颜色（字芯颜色），支持 #RRGGBB。"""
@@ -353,6 +411,7 @@ class TranslationOverlay(QWidget):
     def show_ocr_result(self, original_text, rect):
         """显示OCR识别结果（立即显示，翻译在后台进行）"""
         self._mode = "ocr"
+        self._apply_accent_mode("default")
         # 设置原文内容
         self.original_text.setPlainText(original_text)
         
@@ -386,6 +445,8 @@ class TranslationOverlay(QWidget):
     def show_text_mode(self, title_text: str | None = None, hint_text: str | None = None):
         """进入输入模式：用户手动输入/粘贴文本进行翻译（不走 OCR，也不做预处理）。"""
         self._mode = "input"
+        is_hook_mode = "hook" in str(title_text or "").lower()
+        self._apply_accent_mode("hook" if is_hook_mode else "default")
 
         # 文案与状态
         try:
@@ -424,6 +485,7 @@ class TranslationOverlay(QWidget):
     def show_translation(self, original_text, translated_text, source_lang, target_lang):
         """显示完整的翻译结果（同步模式）"""
         # 设置文本内容
+        self._apply_accent_mode("default")
         self.original_text.setPlainText(original_text)
         
         # 显示翻译结果，隐藏进度条

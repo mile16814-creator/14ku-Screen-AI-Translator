@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLayout,
     QLabel, QPushButton, QComboBox, QGroupBox,
+    QGridLayout,
+    QScrollArea,
     QFrame,
     QCheckBox, QSpinBox, QDoubleSpinBox, QTextEdit,
     QSystemTrayIcon, QMenu, QApplication, QMessageBox,
@@ -35,12 +37,122 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QListWidget,
     QListWidgetItem,
+    QSlider,
 )
-from PyQt6.QtCore import Qt, QRect, QSize, QThread, pyqtSignal, QTimer, QBuffer, QIODevice, QUrl, QObject, QEvent, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QIcon, QAction, QActionGroup, QFont, QDesktopServices, QTextCursor, QColor, QScreen, QGuiApplication, QShortcut, QKeySequence
+from PyQt6.QtCore import Qt, QRect, QSize, QPoint, QThread, pyqtSignal, QTimer, QBuffer, QIODevice, QUrl, QObject, QEvent, QPropertyAnimation, QEasingCurve
+from PyQt6.QtGui import QIcon, QAction, QActionGroup, QFont, QDesktopServices, QTextCursor, QColor, QScreen, QGuiApplication, QShortcut, QKeySequence, QPixmap, QPainter, QPen, QBrush
 import io
 import re
+from src.ui.how_to_page import HowToWindow
 
+
+API_PROVIDER_PRESETS = [
+    ("custom", "自定义", "openai", ""),
+    ("openai", "OpenAI", "openai", "https://api.openai.com/v1"),
+    ("openrouter", "OpenRouter", "openai", "https://openrouter.ai/api/v1"),
+    ("deepseek", "DeepSeek", "openai", "https://api.deepseek.com"),
+    ("groq", "Groq", "openai", "https://api.groq.com/openai/v1"),
+    ("mistral", "Mistral", "openai", "https://api.mistral.ai/v1"),
+    ("xai", "xAI / Grok", "openai", "https://api.x.ai/v1"),
+    ("qwen_cn", "Qwen / 阿里云百炼-北京", "openai", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    ("qwen_sg", "Qwen / 阿里云百炼-新加坡", "openai", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+    ("qwen_us", "Qwen / 阿里云百炼-美国", "openai", "https://dashscope-us.aliyuncs.com/compatible-mode/v1"),
+    ("moonshot", "Kimi / Moonshot", "openai", "https://api.moonshot.ai/v1"),
+    ("glm", "智谱 GLM", "openai", "https://open.bigmodel.cn/api/paas/v4"),
+    ("siliconflow", "SiliconFlow", "openai", "https://api.siliconflow.cn/v1"),
+    ("anthropic", "Claude / Anthropic", "anthropic", "https://api.anthropic.com"),
+    ("gemini", "Gemini", "gemini", "https://generativelanguage.googleapis.com/v1beta"),
+]
+
+
+def _api_provider_by_key(key: str) -> tuple[str, str, str, str]:
+    k = str(key or "").strip()
+    for item in API_PROVIDER_PRESETS:
+        if item[0] == k:
+            return item
+    return API_PROVIDER_PRESETS[0]
+
+
+def _api_provider_key_for_base_url(base_url: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    if not base:
+        return "custom"
+    for key, _label, _provider_type, preset_base in API_PROVIDER_PRESETS:
+        if preset_base and base == preset_base.rstrip("/"):
+            return key
+    return "custom"
+
+
+def _infer_api_provider_type(base_url: str, configured_type: str = "") -> str:
+    t = str(configured_type or "").strip().lower()
+    if t in ("openai", "anthropic", "gemini"):
+        return t
+    b = str(base_url or "").strip().lower()
+    if "anthropic.com" in b:
+        return "anthropic"
+    if "generativelanguage.googleapis.com" in b or "googleapis.com" in b:
+        return "gemini"
+    return "openai"
+
+
+def _api_models_endpoint(base_url: str, provider_type: str, api_key: str = "") -> tuple[str, dict[str, str]]:
+    base = str(base_url or "").strip()
+    if not base:
+        return "", {}
+    if not (base.startswith("http://") or base.startswith("https://")):
+        base = "https://" + base
+    provider = _infer_api_provider_type(base, provider_type)
+    key = str(api_key or "").strip()
+    if provider == "anthropic":
+        root = base.rstrip("/")
+        if root.endswith("/v1"):
+            url = root + "/models"
+        else:
+            url = root + "/v1/models"
+        headers = {"anthropic-version": "2023-06-01"}
+        if key:
+            headers["x-api-key"] = key
+        return url, headers
+    if provider == "gemini":
+        url = base.rstrip("/") + "/models"
+        if key:
+            sep = "&" if "?" in url else "?"
+            url = f"{url}{sep}key={key}"
+        return url, {}
+    if "/v1/" in base:
+        root = base.split("/v1/")[0].rstrip("/") + "/v1"
+        url = root.rstrip("/") + "/models"
+    elif base.rstrip("/").endswith("/v1"):
+        url = base.rstrip("/") + "/models"
+    else:
+        url = base.rstrip("/") + "/models"
+    headers = {}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    return url, headers
+
+
+def _extract_model_ids(data: object, provider_type: str) -> list[str]:
+    raw = []
+    if isinstance(data, dict):
+        if isinstance(data.get("data"), list):
+            raw = data.get("data") or []
+        elif isinstance(data.get("models"), list):
+            raw = data.get("models") or []
+    elif isinstance(data, list):
+        raw = data
+    models: list[str] = []
+    for item in raw:
+        model_id = ""
+        if isinstance(item, str):
+            model_id = item
+        elif isinstance(item, dict):
+            model_id = str(item.get("id") or item.get("name") or item.get("model") or "").strip()
+        if provider_type == "gemini" and model_id.startswith("models/"):
+            model_id = model_id.split("/", 1)[1]
+        if model_id and model_id not in models:
+            models.append(model_id)
+    return models
 
 
 from src.utils.tesseract_manager import TesseractManager
@@ -155,6 +267,96 @@ class _ShadowHoverFilter(QObject):
             except Exception:
                 self._to(self._base_blur)
         return False
+
+
+class _ToggleSwitch(QCheckBox):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setText("")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFixedSize(50, 30)
+
+    def paintEvent(self, event):
+        _ = event
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            rect = self.rect().adjusted(1, 3, -1, -3)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QBrush(QColor("#52C486" if self.isChecked() else "#D9DEE8")))
+            painter.drawRoundedRect(rect, rect.height() / 2.0, rect.height() / 2.0)
+
+            knob_d = rect.height() - 4
+            knob_y = rect.y() + 2
+            knob_x = rect.right() - knob_d - 2 if self.isChecked() else rect.x() + 2
+            painter.setBrush(QBrush(QColor("#FFFFFF")))
+            painter.drawEllipse(QRect(int(knob_x), int(knob_y), int(knob_d), int(knob_d)))
+        finally:
+            painter.end()
+
+
+class _ResourceSparklineWidget(QWidget):
+    """轻量资源曲线：蓝色内存，橙色显存。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._memory_values: deque[float] = deque(maxlen=90)
+        self._gpu_values: deque[float] = deque(maxlen=90)
+        self.setMinimumHeight(74)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def add_sample(self, memory_bytes: float | None, gpu_bytes: float | None) -> None:
+        try:
+            self._memory_values.append(float(memory_bytes or 0))
+        except Exception:
+            self._memory_values.append(0.0)
+        try:
+            self._gpu_values.append(float(gpu_bytes or 0))
+        except Exception:
+            self._gpu_values.append(0.0)
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802 - Qt override
+        super().paintEvent(event)
+        p = QPainter(self)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            rect = self.rect().adjusted(6, 6, -6, -6)
+            if rect.width() <= 8 or rect.height() <= 8:
+                return
+            p.fillRect(self.rect(), QColor("#F8FAFC"))
+            p.setPen(QPen(QColor(226, 232, 240, 180), 1))
+            for i in range(1, 4):
+                y = rect.top() + int(rect.height() * i / 4)
+                p.drawLine(rect.left(), y, rect.right(), y)
+
+            values = list(self._memory_values) + list(self._gpu_values)
+            max_v = max(values) if values else 0.0
+            if max_v <= 0:
+                return
+
+            def points(series: list[float]) -> list[tuple[int, int]]:
+                if not series:
+                    return []
+                n = max(1, len(series) - 1)
+                pts = []
+                for idx, val in enumerate(series):
+                    x = rect.left() + (rect.width() * idx / n)
+                    y = rect.bottom() - (rect.height() * max(0.0, float(val)) / max_v)
+                    pts.append((int(x), int(y)))
+                return pts
+
+            for color, width, series in (
+                ("#1D7BFF", 3, points(list(self._memory_values))),
+                ("#FF9B55", 2, points(list(self._gpu_values))),
+            ):
+                if len(series) < 2:
+                    continue
+                p.setPen(QPen(QColor(color), width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                for a, b in zip(series, series[1:]):
+                    p.drawLine(a[0], a[1], b[0], b[1])
+        finally:
+            p.end()
 
 
 class _UpdateThread(QThread):
@@ -457,18 +659,13 @@ class _ApiProviderProbeThread(QThread):
 
         try:
             import requests
-            headers = {}
-            if self.api_key:
-                headers["Authorization"] = f"Bearer {self.api_key}"
+            provider = _infer_api_provider_type(base_url, "")
+            models_url, model_headers = _api_models_endpoint(base_url, provider, self.api_key)
+            headers = dict(model_headers or {})
             try:
                 candidates = []
-                if "/v1/" in base_url:
-                    root = base_url.split("/v1/")[0].rstrip("/") + "/v1"
-                    candidates.append(root.rstrip("/") + "/models")
-                elif base_url.rstrip("/").endswith("/v1"):
-                    candidates.append(base_url.rstrip("/") + "/models")
-                else:
-                    candidates.append(base_url.rstrip("/") + "/v1/models")
+                if models_url:
+                    candidates.append(models_url)
                 candidates.append(base_url)
 
                 last_code = 0
@@ -501,6 +698,57 @@ class _ApiProviderProbeThread(QThread):
             self.probe_finished.emit(False, "缺少 requests 依赖")
 
 
+class _ApiModelsFetchThread(QThread):
+    models_finished = pyqtSignal(bool, list, str)  # ok, models, message
+
+    def __init__(self, *, base_url: str, api_key: str, provider_type: str, timeout_sec: float = 10.0):
+        super().__init__()
+        self.base_url = str(base_url or "").strip()
+        self.api_key = str(api_key or "").strip()
+        self.provider_type = str(provider_type or "").strip()
+        try:
+            self.timeout_sec = float(timeout_sec)
+        except Exception:
+            self.timeout_sec = 10.0
+
+    def run(self):
+        provider = _infer_api_provider_type(self.base_url, self.provider_type)
+        url, headers = _api_models_endpoint(self.base_url, provider, self.api_key)
+        if not url:
+            self.models_finished.emit(False, [], "未填写BaseURL")
+            return
+        try:
+            import requests
+        except Exception:
+            self.models_finished.emit(False, [], "缺少 requests 依赖")
+            return
+        try:
+            resp = requests.get(url, headers=headers, timeout=self.timeout_sec, allow_redirects=True)
+            code = int(getattr(resp, "status_code", 0) or 0)
+            if code in (401, 403):
+                self.models_finished.emit(False, [], f"鉴权失败（HTTP {code}）")
+                return
+            if code < 200 or code >= 300:
+                self.models_finished.emit(False, [], f"获取失败（HTTP {code}）")
+                return
+            try:
+                data = resp.json()
+            except Exception:
+                self.models_finished.emit(False, [], "返回内容不是JSON")
+                return
+            models = _extract_model_ids(data, provider)
+            if not models:
+                self.models_finished.emit(False, [], "没有读取到模型列表")
+                return
+            self.models_finished.emit(True, models, f"已获取 {len(models)} 个模型")
+        except requests.exceptions.Timeout:
+            self.models_finished.emit(False, [], "请求超时")
+        except requests.exceptions.ConnectionError:
+            self.models_finished.emit(False, [], "网络连接失败")
+        except Exception:
+            self.models_finished.emit(False, [], "请求异常")
+
+
 class _ApiTranslationResult:
     def __init__(self, *, translated_text: str, error: str = "", original_text: str = ""):
         self.translated_text = translated_text
@@ -509,10 +757,11 @@ class _ApiTranslationResult:
 
 
 class _ApiTranslator:
-    def __init__(self, *, base_url: str, api_key: str, model: str = "", timeout_sec: float = 30.0):
+    def __init__(self, *, base_url: str, api_key: str, model: str = "", provider_type: str = "", timeout_sec: float = 30.0):
         self.base_url = str(base_url or "").strip()
         self.api_key = str(api_key or "").strip()
         self.model = str(model or "").strip()
+        self.provider_type = _infer_api_provider_type(self.base_url, provider_type)
         try:
             self.timeout_sec = float(timeout_sec)
         except Exception:
@@ -561,7 +810,7 @@ class _ApiTranslator:
             raise RuntimeError("缺少 requests 依赖")
 
         headers = {"Content-Type": "application/json"}
-        if self.api_key:
+        if self.api_key and self.provider_type == "openai":
             headers["Authorization"] = f"Bearer {self.api_key}"
             headers["X-API-Key"] = self.api_key
 
@@ -578,15 +827,43 @@ class _ApiTranslator:
                 "temperature": 0.2,
             }
         else:
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": "You are a translation engine."},
-                    {"role": "user", "content": prompt},
-                ],
-                "temperature": 0.2,
-                "stream": False,
-            }
+            if self.provider_type == "anthropic":
+                endpoint = self.base_url.rstrip("/")
+                if endpoint and not (endpoint.startswith("http://") or endpoint.startswith("https://")):
+                    endpoint = "https://" + endpoint
+                if not (endpoint.endswith("/v1/messages") or "/v1/messages?" in endpoint):
+                    endpoint = (endpoint[:-3] if endpoint.endswith("/v1") else endpoint) + "/v1/messages"
+                headers["x-api-key"] = self.api_key
+                headers["anthropic-version"] = "2023-06-01"
+                payload = {
+                    "model": self.model,
+                    "max_tokens": 4096,
+                    "temperature": 0.2,
+                    "system": "You are a translation engine.",
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+            elif self.provider_type == "gemini":
+                endpoint = self.base_url.rstrip("/")
+                if endpoint and not (endpoint.startswith("http://") or endpoint.startswith("https://")):
+                    endpoint = "https://" + endpoint
+                endpoint = endpoint + f"/models/{self.model}:generateContent"
+                if self.api_key:
+                    sep = "&" if "?" in endpoint else "?"
+                    endpoint = f"{endpoint}{sep}key={self.api_key}"
+                payload = {
+                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.2},
+                }
+            else:
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": "You are a translation engine."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.2,
+                    "stream": False,
+                }
 
         try:
             resp = requests.post(endpoint, headers=headers, json=payload, timeout=self.timeout_sec)
@@ -610,6 +887,27 @@ class _ApiTranslator:
                 return _ApiTranslationResult(translated_text=str(msg.get("content") or ""), original_text=str(text or ""))
             if data.get("response") is not None:
                 return _ApiTranslationResult(translated_text=str(data.get("response") or ""), original_text=str(text or ""))
+            content = data.get("content")
+            if isinstance(content, list):
+                parts = []
+                for part in content:
+                    if isinstance(part, dict) and part.get("text") is not None:
+                        parts.append(str(part.get("text") or ""))
+                if parts:
+                    return _ApiTranslationResult(translated_text="".join(parts), original_text=str(text or ""))
+            candidates = data.get("candidates")
+            if isinstance(candidates, list) and candidates:
+                c0 = candidates[0] if isinstance(candidates[0], dict) else {}
+                content = c0.get("content") if isinstance(c0, dict) else None
+                gemini_parts = content.get("parts") if isinstance(content, dict) else None
+                if isinstance(gemini_parts, list):
+                    out = "".join(
+                        str(p.get("text") or "")
+                        for p in gemini_parts
+                        if isinstance(p, dict) and p.get("text") is not None
+                    )
+                    if out:
+                        return _ApiTranslationResult(translated_text=out, original_text=str(text or ""))
             choices = data.get("choices")
             if isinstance(choices, list) and choices:
                 c0 = choices[0] if isinstance(choices[0], dict) else {}
@@ -860,10 +1158,24 @@ class MainWindow(QMainWindow):
             pass
 
         self._api_enabled = self.config_manager.get_bool("api", "enabled", False)
+        self._api_provider_key = str(self.config_manager.get("api", "provider_key", "") or "").strip()
+        self._api_provider_type = _infer_api_provider_type(
+            self.config_manager.get("api", "base_url", ""),
+            self.config_manager.get("api", "provider_type", "openai"),
+        )
         self._api_base_url = self.config_manager.get("api", "base_url", "")
         self._api_key = self.config_manager.get("api", "api_key", "")
         self._api_model = str(self.config_manager.get("api", "model", "") or "").strip()
+        if not self._api_provider_key:
+            self._api_provider_key = _api_provider_key_for_base_url(self._api_base_url)
+        elif self._api_provider_key == "custom":
+            inferred_key = _api_provider_key_for_base_url(self._api_base_url)
+            if inferred_key != "custom":
+                self._api_provider_key = inferred_key
+        if not any(p[0] == self._api_provider_key for p in API_PROVIDER_PRESETS):
+            self._api_provider_key = "custom"
         self._api_probe_thread = None
+        self._api_models_fetch_thread = None
         self._api_provider_probe_ok = None
         self._api_provider_probe_message = ""
         self._api_translator = None
@@ -884,6 +1196,13 @@ class MainWindow(QMainWindow):
                 self._api_models = [x.strip() for x in raw_models.split("\n") if x.strip()]
             except Exception:
                 self._api_models = []
+
+        try:
+            provider_state = self._load_api_provider_state(self._api_provider_key)
+            if provider_state:
+                self._apply_api_provider_state(provider_state, update_widgets=False, persist_legacy=False)
+        except Exception:
+            pass
 
         if self._api_model and self._api_model not in self._api_models:
             self._api_models.append(self._api_model)
@@ -909,7 +1228,7 @@ class MainWindow(QMainWindow):
             self.translator = None
             try:
                 if str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
-                    self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
+                    self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, provider_type=self._api_provider_type, timeout_sec=30.0)
                     self.translator = self._api_translator
             except Exception:
                 self._api_translator = None
@@ -1005,8 +1324,8 @@ class MainWindow(QMainWindow):
         # 设置窗口属性
         self.setWindowTitle("14ku屏幕翻译工具")
         # 应用缩放因子到最小尺寸
-        min_width = int(512 * self.scale_factor)
-        min_height = int(700 * self.scale_factor)
+        min_width = int(1180 * self.scale_factor)
+        min_height = int(730 * self.scale_factor)
         self.setMinimumSize(min_width, min_height)
 
         # 初始化资源监控（不阻塞 UI）
@@ -1146,32 +1465,52 @@ class MainWindow(QMainWindow):
         if active:
             return """
                 QPushButton {
-                    background-color: #f44336;
-                    color: white;
-                    font-weight: bold;
-                    padding: 10px;
-                    border-radius: 5px;
+                    background-color: rgba(254, 243, 243, 0.98);
+                    color: #E45858;
+                    font-weight: 800;
+                    font-size: 14px;
+                    text-align: left;
+                    padding: 0px;
+                    border-radius: 18px;
+                    border: 1px solid rgba(239, 128, 128, 0.78);
                 }
                 QPushButton:hover {
-                    background-color: #d32f2f;
+                    background-color: #FFFFFF;
+                    border-color: rgba(228, 88, 88, 0.92);
                 }
                 QPushButton:pressed {
-                    background-color: #b71c1c;
+                    background-color: rgba(254, 234, 234, 0.98);
+                    border-color: rgba(220, 68, 68, 0.98);
+                }
+                QPushButton:disabled {
+                    color: rgba(228, 88, 88, 0.52);
+                    background-color: rgba(254, 243, 243, 0.76);
+                    border-color: rgba(239, 128, 128, 0.40);
                 }
             """
         return """
             QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-                padding: 10px;
-                border-radius: 5px;
+                background-color: rgba(242, 252, 246, 0.98);
+                color: #2FB369;
+                font-weight: 800;
+                font-size: 14px;
+                text-align: left;
+                padding: 0px;
+                border-radius: 18px;
+                border: 1px solid rgba(112, 215, 154, 0.62);
             }
             QPushButton:hover {
-                background-color: #45a049;
+                background-color: #FFFFFF;
+                border-color: rgba(82, 196, 134, 0.82);
             }
             QPushButton:pressed {
-                background-color: #3d8b40;
+                background-color: rgba(236, 253, 243, 0.98);
+                border-color: rgba(63, 186, 119, 0.90);
+            }
+            QPushButton:disabled {
+                color: rgba(47, 179, 105, 0.55);
+                background-color: rgba(242, 252, 246, 0.70);
+                border-color: rgba(112, 215, 154, 0.30);
             }
         """
 
@@ -1202,7 +1541,7 @@ class MainWindow(QMainWindow):
         """把 scale_factor 应用到会用到缩放的 UI 属性上（无需重建整个 UI）"""
         # 最小尺寸
         try:
-            self.setMinimumSize(int(512 * self.scale_factor), int(700 * self.scale_factor))
+            self.setMinimumSize(int(1180 * self.scale_factor), int(730 * self.scale_factor))
         except Exception:
             pass
         try:
@@ -1257,8 +1596,8 @@ class MainWindow(QMainWindow):
                 return
 
             # 目标：不占满屏，但也别太小；并跟随 scale_factor
-            target_w = int(round(596 * float(self.scale_factor)))
-            target_h = int(round(760 * float(self.scale_factor))) + int(round(136 * float(self.scale_factor))) - int(round(350 * float(self.scale_factor)))
+            target_w = int(round(1180 * float(self.scale_factor)))
+            target_h = int(round(730 * float(self.scale_factor)))
 
             # 约束在屏幕可用区域的 90% 内
             max_w = int(round(g.width() * 0.9))
@@ -1377,7 +1716,554 @@ class MainWindow(QMainWindow):
     
     def _scale_font_size(self, size: int) -> int:
         """根据缩放因子调整字体大小"""
-        return int(size * self.scale_factor)
+        try:
+            scaled = int(round(float(size) * float(self.scale_factor)))
+        except Exception:
+            scaled = int(size or 1)
+        return max(1, scaled)
+
+    def _resolve_asset_icon_path(self) -> str:
+        try:
+            root = Path(__file__).resolve().parent.parent.parent
+            icon_path = root / "assets" / "icons" / "app_icon.ico"
+            if icon_path.exists():
+                return str(icon_path)
+        except Exception:
+            pass
+        return ""
+
+    def _make_line_icon(self, name: str, color: QColor | str | None = None) -> QIcon:
+        c = QColor(color or "#64748B")
+        pix = QPixmap(24, 24)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            pen = QPen(c, 2)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(pen)
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            n = str(name or "").lower()
+            if n == "home":
+                p.drawLine(5, 12, 12, 6)
+                p.drawLine(12, 6, 19, 12)
+                p.drawLine(7, 11, 7, 19)
+                p.drawLine(17, 11, 17, 19)
+                p.drawLine(7, 19, 17, 19)
+                p.drawLine(10, 19, 10, 15)
+                p.drawLine(14, 19, 14, 15)
+                p.drawLine(10, 15, 14, 15)
+            elif n == "history":
+                p.drawEllipse(5, 5, 14, 14)
+                p.drawLine(12, 8, 12, 13)
+                p.drawLine(12, 13, 15, 15)
+            elif n == "play":
+                p.save()
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(c)
+                p.drawRoundedRect(3, 3, 18, 18, 5, 5)
+                p.setBrush(QColor("#FFFFFF"))
+                tri = [QPoint(10, 8), QPoint(16, 12), QPoint(10, 16)]
+                p.drawPolygon(*tri)
+                p.restore()
+            elif n == "keyboard":
+                p.save()
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor("#F3F4F6"))
+                p.drawRoundedRect(3, 3, 18, 18, 5, 5)
+                p.restore()
+                p.drawRoundedRect(6, 8, 12, 8, 2, 2)
+                for x in (7, 10, 13, 16):
+                    p.drawLine(x, 10, x + 1, 10)
+                    p.drawLine(x, 13, x + 1, 13)
+                p.drawLine(8, 16, 16, 16)
+            elif n == "target":
+                p.save()
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor("#3B82F6"))
+                p.drawRoundedRect(3, 3, 18, 18, 5, 5)
+                p.restore()
+                pen = QPen(QColor("#FFFFFF"), 2)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                p.setPen(pen)
+                p.drawEllipse(6, 6, 12, 12)
+                p.drawEllipse(10, 10, 4, 4)
+                p.drawLine(12, 3, 12, 6)
+                p.drawLine(12, 18, 12, 21)
+                p.drawLine(3, 12, 6, 12)
+                p.drawLine(18, 12, 21, 12)
+            elif n == "image":
+                p.save()
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(QColor("#F3F4F6"))
+                p.drawRoundedRect(3, 3, 18, 18, 5, 5)
+                p.restore()
+                p.drawRoundedRect(6, 6, 12, 12, 2, 2)
+                p.drawLine(8, 15, 11, 12)
+                p.drawLine(11, 12, 14, 14)
+                p.drawLine(14, 14, 18, 10)
+                p.drawEllipse(9, 9, 2, 2)
+            elif n == "globe":
+                p.drawEllipse(5, 5, 14, 14)
+                p.drawLine(12, 5, 12, 19)
+                p.drawArc(8, 5, 8, 14, 90 * 16, 180 * 16)
+                p.drawArc(8, 5, 8, 14, 270 * 16, 180 * 16)
+                p.drawLine(5, 12, 19, 12)
+            elif n == "camera":
+                p.drawRoundedRect(5, 8, 14, 10, 3, 3)
+                p.drawRoundedRect(8, 6, 4, 3, 1, 1)
+                p.drawEllipse(10, 11, 4, 4)
+            elif n == "window":
+                p.drawRoundedRect(5, 5, 14, 14, 3, 3)
+                p.drawLine(5, 9, 19, 9)
+            elif n == "glossary":
+                p.drawRoundedRect(6, 4, 12, 16, 2, 2)
+                p.drawLine(9, 8, 15, 8)
+                p.drawLine(9, 12, 15, 12)
+                p.drawLine(9, 16, 13, 16)
+            elif n == "reuse":
+                p.drawEllipse(9, 9, 6, 6)
+                for x1, y1, x2, y2 in ((12, 3, 12, 6), (12, 18, 12, 21), (3, 12, 6, 12), (18, 12, 21, 12), (5, 5, 7, 7), (17, 17, 19, 19), (19, 5, 17, 7), (7, 17, 5, 19)):
+                    p.drawLine(x1, y1, x2, y2)
+            elif n == "cloud":
+                p.drawArc(5, 10, 8, 8, 40 * 16, 220 * 16)
+                p.drawArc(10, 6, 9, 9, 25 * 16, 180 * 16)
+                p.drawArc(13, 11, 7, 7, -40 * 16, 210 * 16)
+                p.drawLine(8, 18, 18, 18)
+            elif n == "memory":
+                p.drawRoundedRect(6, 7, 12, 10, 2, 2)
+                for x in (8, 11, 14, 17):
+                    p.drawLine(x, 5, x, 7)
+                    p.drawLine(x, 17, x, 19)
+            elif n == "cpu":
+                p.drawRoundedRect(7, 7, 10, 10, 2, 2)
+                p.drawRect(10, 10, 4, 4)
+                for v in (5, 19):
+                    p.drawLine(v, 9, v, 10)
+                    p.drawLine(v, 14, v, 15)
+                    p.drawLine(9, v, 10, v)
+                    p.drawLine(14, v, 15, v)
+            elif n == "gpu":
+                p.drawRoundedRect(5, 7, 14, 10, 2, 2)
+                p.drawLine(8, 17, 8, 20)
+                p.drawLine(16, 17, 16, 20)
+                p.drawLine(9, 12, 15, 12)
+            elif n == "save":
+                p.drawRoundedRect(5, 4, 14, 16, 2, 2)
+                p.drawLine(8, 4, 8, 10)
+                p.drawLine(8, 10, 16, 10)
+                p.drawLine(16, 4, 16, 10)
+                p.drawRoundedRect(8, 14, 8, 6, 1, 1)
+            elif n == "book":
+                p.drawRoundedRect(5, 5, 6, 14, 2, 2)
+                p.drawRoundedRect(13, 5, 6, 14, 2, 2)
+                p.drawLine(12, 6, 12, 20)
+                p.drawLine(7, 8, 10, 8)
+                p.drawLine(15, 8, 18, 8)
+            elif n == "power":
+                p.drawLine(12, 4, 12, 12)
+                p.drawArc(6, 7, 12, 12, 210 * 16, 300 * 16)
+            else:
+                p.drawEllipse(8, 8, 8, 8)
+        finally:
+            p.end()
+        return QIcon(pix)
+
+    def _get_quick_action_button_base_css(self, tone: str = "neutral") -> str:
+        if str(tone or "").lower() == "blue":
+            return """
+                QPushButton {
+                    background-color: rgba(242, 248, 255, 0.98);
+                    color: #2563EB;
+                    text-align: left;
+                    font-weight: 800;
+                    font-size: 15px;
+                    padding: 16px 18px;
+                    border-radius: 18px;
+                    border: 1px solid rgba(96, 165, 250, 0.42);
+                }
+                QPushButton:hover {
+                    background-color: #FFFFFF;
+                    border-color: rgba(59, 130, 246, 0.62);
+                }
+                QPushButton:pressed {
+                    background-color: rgba(219, 234, 254, 0.96);
+                    border-color: rgba(37, 99, 235, 0.70);
+                }
+                QPushButton:disabled {
+                    color: rgba(37, 99, 235, 0.46);
+                    background-color: rgba(242, 248, 255, 0.66);
+                    border-color: rgba(96, 165, 250, 0.20);
+                }
+            """
+        return """
+            QPushButton {
+                background-color: rgba(255, 255, 255, 0.98);
+                color: #111827;
+                text-align: left;
+                font-weight: 800;
+                font-size: 15px;
+                padding: 16px 18px;
+                border-radius: 18px;
+                border: 1px solid rgba(148, 163, 184, 0.26);
+            }
+            QPushButton:hover {
+                background-color: #FFFFFF;
+                border-color: rgba(100, 116, 139, 0.38);
+            }
+            QPushButton:pressed {
+                background-color: rgba(248, 250, 252, 0.98);
+                border-color: rgba(100, 116, 139, 0.46);
+            }
+            QPushButton:disabled {
+                color: rgba(17, 24, 39, 0.38);
+                background-color: rgba(255, 255, 255, 0.72);
+                border-color: rgba(148, 163, 184, 0.16);
+            }
+        """
+
+    def _configure_home_action_card(
+        self,
+        button: QPushButton,
+        *,
+        object_name: str,
+        icon_name: str,
+        icon_color: str,
+        title: str,
+        subtitle: str,
+        tone_css: str,
+    ) -> None:
+        try:
+            button.setObjectName(object_name)
+            button.setText("")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setMinimumHeight(self._scale_size(92))
+            button.setIcon(QIcon())
+        except Exception:
+            pass
+        self._set_scaled_stylesheet(button, tone_css)
+
+        layout = QHBoxLayout(button)
+        layout.setContentsMargins(self._scale_size(24), self._scale_size(18), self._scale_size(24), self._scale_size(18))
+        layout.setSpacing(self._scale_size(18))
+
+        icon_label = QLabel()
+        try:
+            icon_label.setPixmap(self._make_line_icon(icon_name, icon_color).pixmap(QSize(self._scale_size(86), self._scale_size(86))))
+            icon_label.setFixedSize(self._scale_size(86), self._scale_size(86))
+        except Exception:
+            pass
+        layout.addWidget(icon_label, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        text_wrap = QWidget()
+        text_layout = QVBoxLayout(text_wrap)
+        text_layout.setContentsMargins(0, 0, 0, 0)
+        text_layout.setSpacing(self._scale_size(8))
+
+        title_label = QLabel(title)
+        title_label.setObjectName("actionCardTitle")
+        subtitle_label = QLabel(subtitle)
+        subtitle_label.setObjectName("actionCardSubtitle")
+        try:
+            subtitle_label.setWordWrap(True)
+        except Exception:
+            pass
+        text_layout.addWidget(title_label)
+        text_layout.addWidget(subtitle_label)
+        layout.addWidget(text_wrap, 1, Qt.AlignmentFlag.AlignVCenter)
+
+        button._card_title_label = title_label  # type: ignore[attr-defined]
+        button._card_subtitle_label = subtitle_label  # type: ignore[attr-defined]
+        button._card_icon_label = icon_label  # type: ignore[attr-defined]
+
+    def _set_home_action_card_text(
+        self,
+        button: QPushButton | None,
+        *,
+        title: str,
+        subtitle: str,
+        title_color: str | None = None,
+        subtitle_color: str | None = None,
+    ) -> None:
+        if button is None:
+            return
+        try:
+            title_label = getattr(button, "_card_title_label", None)
+            subtitle_label = getattr(button, "_card_subtitle_label", None)
+            if title_label is not None:
+                title_label.setText(str(title or ""))
+                if title_color:
+                    title_label.setStyleSheet(f"color: {title_color};")
+            if subtitle_label is not None:
+                subtitle_label.setText(str(subtitle or ""))
+                if subtitle_color:
+                    subtitle_label.setStyleSheet(f"color: {subtitle_color};")
+        except Exception:
+            pass
+
+    def _set_home_action_card_icon(
+        self,
+        button: QPushButton | None,
+        *,
+        icon_name: str,
+        icon_color: str,
+    ) -> None:
+        if button is None:
+            return
+        try:
+            icon_label = getattr(button, "_card_icon_label", None)
+            if icon_label is not None:
+                icon_label.setPixmap(
+                    self._make_line_icon(icon_name, icon_color).pixmap(
+                        QSize(self._scale_size(86), self._scale_size(86))
+                    )
+                )
+        except Exception:
+            pass
+
+    def _make_status_dot(self, state: str = "unknown") -> QFrame:
+        dot = QFrame()
+        dot.setObjectName("statusDot")
+        dot.setFixedSize(self._scale_size(8), self._scale_size(8))
+        self._set_status_dot_state(dot, state)
+        return dot
+
+    def _set_status_dot_state(self, dot: QFrame | None, state: str) -> None:
+        if dot is None:
+            return
+        color = {
+            "ok": "#2FAC66",
+            "warn": "#D97706",
+            "bad": "#94A3B8",
+            "unknown": "#CBD5E1",
+        }.get(str(state or "unknown"), "#CBD5E1")
+        dot.setStyleSheet(f"QFrame#statusDot {{ background-color: {color}; border-radius: {self._scale_size(4)}px; }}")
+
+    def _status_state_for_text(self, value: str) -> str:
+        text = str(value or "").strip()
+        lower = text.lower()
+        if not text or text == "-":
+            return "unknown"
+        if any(x in text for x in ("可用", "就绪", "已启用", "运行中")) or "cuda" in lower:
+            return "ok"
+        if any(x in text for x in ("初始化", "检查", "加载")):
+            return "warn"
+        if any(x in text for x in ("不可用", "未启用", "未找到", "未选择", "失败", "错误")):
+            return "bad"
+        return "ok"
+
+    def _make_nav_button(self, key: str, icon_name: str, label: str, callback) -> QToolButton:
+        btn = QToolButton()
+        btn.setObjectName("sidebarNavButton")
+        btn.setCheckable(True)
+        btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        btn.setText(label)
+        btn.setIcon(self._make_line_icon(icon_name))
+        btn.setIconSize(QSize(self._scale_size(18), self._scale_size(18)))
+        btn.clicked.connect(callback)
+        btn.setMinimumHeight(self._scale_size(44))
+        btn.setMinimumWidth(self._scale_size(250))
+        btn.setProperty("nav_key", key)
+        btn.setProperty("nav_icon", icon_name)
+        try:
+            f = btn.font()
+            f.setPointSize(self._scale_font_size(11))
+            f.setBold(True)
+            btn.setFont(f)
+        except Exception:
+            pass
+        return btn
+
+    def _create_sidebar(self) -> QFrame:
+        sidebar = QFrame()
+        sidebar.setObjectName("sidebar")
+        sidebar.setFixedWidth(self._scale_size(310))
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(self._scale_size(22), self._scale_size(28), self._scale_size(22), self._scale_size(28))
+        layout.setSpacing(self._scale_size(18))
+
+        brand = QFrame()
+        brand.setObjectName("brandBlock")
+        brand_layout = QVBoxLayout(brand)
+        brand_layout.setContentsMargins(0, 0, 0, 0)
+        brand_layout.setSpacing(self._scale_size(4))
+        title = QLabel("14ku屏幕翻译工具")
+        title.setObjectName("brandTitle")
+        subtitle = QLabel("官网  |  14ku.date")
+        subtitle.setObjectName("brandSubtitle")
+        brand_layout.addWidget(title)
+        brand_layout.addWidget(subtitle)
+        layout.addWidget(brand)
+
+        self._nav_buttons = {}
+        nav_items = [
+            ("main", "home", "主页", self.show_main_view),
+            ("history", "history", "历史记录", self.show_history_dialog),
+            ("glossary", "glossary", "翻译词库", self.show_glossary_view),
+            ("reuse", "reuse", "智能复用", self.show_translation_reuse_view),
+            ("system_status", "cloud", "API服务", self.show_system_status_dialog),
+        ]
+        nav_layout = QVBoxLayout()
+        nav_layout.setSpacing(self._scale_size(10))
+        for key, icon_text, label, cb in nav_items:
+            btn = self._make_nav_button(key, icon_text, label, cb)
+            self._nav_buttons[key] = btn
+            nav_layout.addWidget(btn)
+        layout.addLayout(nav_layout)
+
+        status = QFrame()
+        status.setObjectName("sidebarStatus")
+        status_layout = QVBoxLayout(status)
+        status_layout.setContentsMargins(self._scale_size(16), self._scale_size(16), self._scale_size(16), self._scale_size(16))
+        status_layout.setSpacing(self._scale_size(10))
+
+        head = QHBoxLayout()
+        status_title = QLabel("服务状态")
+        status_title.setObjectName("sidebarSectionTitle")
+        running_wrap = QWidget()
+        running_layout = QHBoxLayout(running_wrap)
+        running_layout.setContentsMargins(0, 0, 0, 0)
+        running_layout.setSpacing(self._scale_size(6))
+        self._sidebar_running_dot = self._make_status_dot("ok")
+        self._sidebar_running_label = QLabel("运行中")
+        self._sidebar_running_label.setObjectName("sidebarOk")
+        running_layout.addWidget(self._sidebar_running_dot)
+        running_layout.addWidget(self._sidebar_running_label)
+        head.addWidget(status_title)
+        head.addStretch()
+        head.addWidget(running_wrap)
+        status_layout.addLayout(head)
+
+        self._sidebar_service_rows = {}
+        for key, label, value in [
+            ("translation", "翻译服务", "-"),
+            ("tesseract", "Tesseract", "-"),
+            ("ocr", "OCR", "-"),
+            ("model", "模型", "-"),
+        ]:
+            row = QHBoxLayout()
+            row.setSpacing(self._scale_size(10))
+            dot = self._make_status_dot("unknown")
+            name = QLabel(label)
+            name.setObjectName("sidebarStatusName")
+            val = QLabel(value)
+            val.setObjectName("sidebarStatusValue")
+            row.addWidget(dot)
+            row.addWidget(name)
+            row.addStretch()
+            row.addWidget(val)
+            status_layout.addLayout(row)
+            self._sidebar_service_rows[key] = {"dot": dot, "value": val}
+
+        line = QFrame()
+        line.setFrameShape(QFrame.Shape.HLine)
+        line.setObjectName("sidebarDivider")
+        status_layout.addWidget(line)
+
+        resources_title = QLabel("资源概览")
+        resources_title.setObjectName("sidebarSectionTitle")
+        status_layout.addWidget(resources_title)
+
+        self._sidebar_resource_rows = {}
+        for key, label, value in [
+            ("memory", "内存占用", "-"),
+            ("gpu", "显存占用", "-"),
+        ]:
+            row = QHBoxLayout()
+            row.setSpacing(self._scale_size(10))
+            icon = QLabel()
+            icon.setObjectName("sidebarResourceIcon")
+            icon.setFixedSize(self._scale_size(20), self._scale_size(20))
+            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            icon_name = "memory" if key == "memory" else "gpu"
+            icon.setPixmap(self._make_line_icon(icon_name, "#8090A8").pixmap(QSize(self._scale_size(18), self._scale_size(18))))
+            name = QLabel(label)
+            name.setObjectName("sidebarResourceName")
+            val = QLabel(value)
+            val.setObjectName("sidebarStatusValue")
+            row.addWidget(icon)
+            row.addWidget(name)
+            row.addStretch()
+            row.addWidget(val)
+            status_layout.addLayout(row)
+            self._sidebar_resource_rows[key] = val
+
+        self.resource_chart = _ResourceSparklineWidget()
+        try:
+            self.resource_chart.setMinimumHeight(self._scale_size(58))
+            self.resource_chart.setMaximumHeight(self._scale_size(72))
+        except Exception:
+            pass
+        status_layout.addWidget(self.resource_chart)
+
+        layout.addWidget(status)
+        layout.addStretch()
+        return sidebar
+
+    def _set_sidebar_row(self, group: str, key: str, value: str) -> None:
+        try:
+            rows = self._sidebar_service_rows if group == "service" else self._sidebar_resource_rows
+            item = rows.get(key)
+            if group == "service" and isinstance(item, dict):
+                label = item.get("value")
+                dot = item.get("dot")
+                text = str(value or "-")
+                if label is not None:
+                    label.setText(text)
+                self._set_status_dot_state(dot, self._status_state_for_text(text))
+            elif item is not None:
+                item.setText(str(value or "-"))
+        except Exception:
+            pass
+
+    def _refresh_sidebar_status(self) -> None:
+        try:
+            self._set_sidebar_row("service", "translation", "已启用" if self.is_translating else "未启用")
+        except Exception:
+            pass
+        try:
+            t_text = self.tesseract_status_label.text()
+            self._set_sidebar_row("service", "tesseract", t_text.split(":", 1)[-1].strip() if ":" in t_text else t_text)
+        except Exception:
+            pass
+        try:
+            o_text = self.ocr_status_label.text()
+            self._set_sidebar_row("service", "ocr", o_text.split(":", 1)[-1].strip() if ":" in o_text else o_text)
+        except Exception:
+            pass
+        try:
+            m_text = self.model_status_label.text()
+            self._set_sidebar_row("service", "model", m_text.split(":", 1)[-1].strip() if ":" in m_text else m_text)
+        except Exception:
+            pass
+        try:
+            p_text = self.process_resource_label.text()
+            if ":" in p_text:
+                body = p_text.split(":", 1)[-1].strip()
+                mem_value = body.split("|", 1)[0].strip()
+                if mem_value.startswith("内存"):
+                    mem_value = mem_value.replace("内存", "", 1).strip()
+                self._set_sidebar_row("resource", "memory", mem_value)
+                gpu_value = "-"
+                if "显存" in body:
+                    try:
+                        gpu_value = body.split("显存", 1)[-1].split("|", 1)[0].strip()
+                    except Exception:
+                        gpu_value = "-"
+                self._set_sidebar_row("resource", "gpu", gpu_value)
+        except Exception:
+            pass
+        try:
+            if bool(getattr(self, "_api_enabled", False)):
+                api_model = str(getattr(self, "_api_model", "") or "").strip()
+                self._set_sidebar_row("service", "model", f"API  {api_model}" if api_model else "API  未选择模型")
+            else:
+                m_text = self.model_status_label.text()
+                self._set_sidebar_row("service", "model", m_text.split(":", 1)[-1].strip() if ":" in m_text else m_text)
+        except Exception:
+            pass
         
     def init_ui(self):
         """初始化用户界面"""
@@ -1388,17 +2274,28 @@ class MainWindow(QMainWindow):
         self._apply_main_page_theme(central_widget)
         
         # 主布局
-        main_layout = QVBoxLayout(central_widget)
+        main_layout = QHBoxLayout(central_widget)
         self._main_layout = main_layout
-        main_layout.setSpacing(self._scale_size(15))
-        main_layout.setContentsMargins(self._scale_size(20), self._scale_size(20), self._scale_size(20), self._scale_size(20))
-        
-        # 1. 标题区域
+        main_layout.setSpacing(self._scale_size(20))
+        main_layout.setContentsMargins(self._scale_size(18), self._scale_size(18), self._scale_size(18), self._scale_size(18))
+
+        self._sidebar = self._create_sidebar()
+        main_layout.addWidget(self._sidebar, 0)
+
+        content_shell = QFrame()
+        content_shell.setObjectName("contentArea")
+        content_layout = QVBoxLayout(content_shell)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(self._scale_size(18))
+        main_layout.addWidget(content_shell, 1)
+
+        # 1. 视图导航（保留菜单 action，给托盘/旧逻辑复用；主入口改为左侧导航）
         header = QFrame()
         header.setObjectName("heroHeader")
+        header.hide()
         header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(self._scale_size(16), self._scale_size(14), self._scale_size(16), self._scale_size(14))
-        header_layout.setSpacing(self._scale_size(8))
+        header_layout.setContentsMargins(0, 0, 0, 0)
+        header_layout.setSpacing(0)
 
         self._hero_menu_button = QToolButton()
         self._hero_menu_button.setText("≡")
@@ -1504,44 +2401,50 @@ class MainWindow(QMainWindow):
         self._hero_menu_placeholder = QWidget()
         self._hero_menu_placeholder.setFixedWidth(self._scale_size(36))
         header_layout.addWidget(self._hero_menu_placeholder, 0)
-        main_layout.addWidget(header)
+        content_layout.addWidget(header)
 
-        self._view_main = QWidget()
+        self._view_main = QFrame()
+        self._view_main.setObjectName("contentShell")
         self._view_main_layout = QVBoxLayout(self._view_main)
-        self._view_main_layout.setContentsMargins(0, 0, 0, 0)
+        self._view_main_layout.setContentsMargins(self._scale_size(24), self._scale_size(24), self._scale_size(24), self._scale_size(24))
         self._view_main_layout.setSpacing(self._scale_size(15))
-        main_layout.addWidget(self._view_main, 1)
+        self._view_main_scroll = QScrollArea()
+        self._view_main_scroll.setWidgetResizable(True)
+        self._view_main_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._view_main_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self._view_main_scroll.setWidget(self._view_main)
+        content_layout.addWidget(self._view_main_scroll, 1)
 
         self._view_status = QWidget()
         self._view_status_layout = QVBoxLayout(self._view_status)
         self._view_status_layout.setContentsMargins(0, 0, 0, 0)
         self._view_status_layout.setSpacing(self._scale_size(15))
-        main_layout.addWidget(self._view_status, 1)
+        content_layout.addWidget(self._view_status, 1)
 
         self._view_history = QWidget()
         self._view_history_layout = QVBoxLayout(self._view_history)
         self._view_history_layout.setContentsMargins(0, 0, 0, 0)
         self._view_history_layout.setSpacing(self._scale_size(15))
-        main_layout.addWidget(self._view_history, 1)
+        content_layout.addWidget(self._view_history, 1)
 
         self._view_hook = QWidget()
         self._view_hook_layout = QVBoxLayout(self._view_hook)
         self._view_hook_layout.setContentsMargins(0, 0, 0, 0)
         self._view_hook_layout.setSpacing(self._scale_size(15))
-        main_layout.addWidget(self._view_hook, 1)
+        content_layout.addWidget(self._view_hook, 1)
 
         self._view_glossary = QWidget()
         self._view_glossary_layout = QVBoxLayout(self._view_glossary)
         self._view_glossary_layout.setContentsMargins(0, 0, 0, 0)
         self._view_glossary_layout.setSpacing(self._scale_size(15))
-        main_layout.addWidget(self._view_glossary, 1)
+        content_layout.addWidget(self._view_glossary, 1)
 
         self._view_reuse = QWidget()
         self._view_reuse_layout = QVBoxLayout(self._view_reuse)
         self._view_reuse_layout.setContentsMargins(0, 0, 0, 0)
         self._view_reuse_layout.setSpacing(self._scale_size(15))
-        main_layout.addWidget(self._view_reuse, 1)
-        
+        content_layout.addWidget(self._view_reuse, 1)
+
         # 2. 状态区域（启动期展示：组件状态 + 资源占用）
         status_group = QGroupBox("系统状态")
         self._system_status_group = status_group
@@ -1564,17 +2467,34 @@ class MainWindow(QMainWindow):
 
         self.model_resource_label = QLabel("模型资源: 不可用")
         status_layout.addWidget(self.model_resource_label)
-        self.ocr_resource_label = QLabel("OCR资源: -")
-        status_layout.addWidget(self.ocr_resource_label)
-
-        self.process_resource_label = QLabel("进程资源: -")
+        self.process_resource_label = QLabel("资源占用: -")
         status_layout.addWidget(self.process_resource_label)
 
         status_group.setLayout(status_layout)
         self._view_status_layout.addWidget(status_group)
+        status_group.hide()
 
         api_card = QGroupBox("API服务")
         api_card_layout = QVBoxLayout()
+
+        api_provider_layout = QHBoxLayout()
+        api_provider_layout.addWidget(QLabel("服务商:"))
+        self.api_provider_combo = QComboBox()
+        for key, label, provider_type, base_url in API_PROVIDER_PRESETS:
+            self.api_provider_combo.addItem(label, {"key": key, "provider_type": provider_type, "base_url": base_url})
+        try:
+            preset_index = 0
+            for i, (_key, _label, provider_type, _base_url) in enumerate(API_PROVIDER_PRESETS):
+                if _key == str(getattr(self, "_api_provider_key", "") or "custom"):
+                    preset_index = i
+                    self._api_provider_type = provider_type
+                    break
+            self.api_provider_combo.setCurrentIndex(preset_index)
+        except Exception:
+            pass
+        self.api_provider_combo.currentIndexChanged.connect(self._on_api_provider_preset_changed)
+        api_provider_layout.addWidget(self.api_provider_combo, 1)
+        api_card_layout.addLayout(api_provider_layout)
 
         api_base_url_layout = QHBoxLayout()
         api_base_url_layout.addWidget(QLabel("BaseURL:"))
@@ -1612,10 +2532,20 @@ class MainWindow(QMainWindow):
 
         api_model_add_row = QHBoxLayout()
         api_model_add_row.addStretch()
-        self.api_model_add_button = QToolButton()
-        self.api_model_add_button.setText("+")
+        self.api_model_fetch_button = QToolButton()
+        self.api_model_fetch_button.setText("自动获取模型")
         try:
-            self.api_model_add_button.setFixedSize(self._scale_size(26), self._scale_size(26))
+            self.api_model_fetch_button.setMinimumWidth(self._scale_size(88))
+            self.api_model_fetch_button.setFixedHeight(self._scale_size(30))
+        except Exception:
+            pass
+        self.api_model_fetch_button.clicked.connect(self._fetch_api_models)
+        api_model_add_row.addWidget(self.api_model_fetch_button, 0, Qt.AlignmentFlag.AlignRight)
+        self.api_model_add_button = QToolButton()
+        self.api_model_add_button.setText("添加模型")
+        try:
+            self.api_model_add_button.setMinimumWidth(self._scale_size(88))
+            self.api_model_add_button.setFixedHeight(self._scale_size(30))
         except Exception:
             pass
         self.api_model_add_button.clicked.connect(self._add_api_model_dialog)
@@ -1635,36 +2565,81 @@ class MainWindow(QMainWindow):
         api_card_layout.addWidget(self.api_enable_button)
 
         api_card.setLayout(api_card_layout)
-        self._view_status_layout.addWidget(api_card)
+        self._view_status_layout.addWidget(api_card, 1)
         self._api_card = api_card
         
-        # 3. 控制区域
-        control_group = QGroupBox("翻译控制")
-        control_layout = QVBoxLayout()
+        page_title = QLabel("翻译控制")
+        page_title.setObjectName("homePageTitle")
+        page_title_font = QFont()
+        page_title_font.setPointSize(self._scale_font_size(24))
+        page_title_font.setBold(True)
+        page_title.setFont(page_title_font)
+        self._view_main_layout.addWidget(page_title)
+
+        page_subtitle = QLabel("快速开始与模式选择")
+        page_subtitle.setObjectName("homePageSubtitle")
+        self._view_main_layout.addWidget(page_subtitle)
+
+        # 3. 快速开始区域
+        control_group = QGroupBox("")
+        control_layout = QGridLayout()
+        control_layout.setHorizontalSpacing(self._scale_size(16))
+        control_layout.setVerticalSpacing(self._scale_size(16))
         
         # 启动/停止按钮（快捷键信息稍后根据配置更新）
         self.translate_button = QPushButton()
-        self._set_scaled_stylesheet(self.translate_button, self._get_translate_button_base_css(active=False))
+        self._configure_home_action_card(
+            self.translate_button,
+            object_name="primaryActionCard",
+            icon_name="play",
+            icon_color="#49C97E",
+            title="启动翻译",
+            subtitle="开始屏幕识别与实时翻译",
+            tone_css=self._get_translate_button_base_css(active=False),
+        )
         self.translate_button.clicked.connect(self.toggle_translation)
-        control_layout.addWidget(self.translate_button)
+        control_layout.addWidget(self.translate_button, 0, 0)
 
         # 输入模式按钮（手动输入翻译，不走 OCR）
-        self.text_mode_button = QPushButton("输入模式（手动输入）")
+        self.text_mode_button = QPushButton()
+        self._configure_home_action_card(
+            self.text_mode_button,
+            object_name="secondaryActionCard",
+            icon_name="keyboard",
+            icon_color="#6B7280",
+            title="输入模式",
+            subtitle="手动输入文本进行翻译",
+            tone_css=self._get_quick_action_button_base_css("neutral"),
+        )
         self.text_mode_button.clicked.connect(self.open_text_mode)
-        control_layout.addWidget(self.text_mode_button)
+        control_layout.addWidget(self.text_mode_button, 0, 1)
 
         self.hook_mode_button = QPushButton()
-        try:
-            self.hook_mode_button.setObjectName("hookModeButton")
-        except Exception:
-            pass
+        self._configure_home_action_card(
+            self.hook_mode_button,
+            object_name="hookModeButton",
+            icon_name="target",
+            icon_color="#3B82F6",
+            title="Hook 模式",
+            subtitle="适配游戏与传统程序文本捕获",
+            tone_css=self._get_quick_action_button_base_css("blue"),
+        )
         self.hook_mode_button.clicked.connect(self.show_hook_view)
-        control_layout.addWidget(self.hook_mode_button)
+        control_layout.addWidget(self.hook_mode_button, 1, 0)
         
         # 测试按钮
-        self.test_button = QPushButton("测试截图和翻译")
+        self.test_button = QPushButton()
+        self._configure_home_action_card(
+            self.test_button,
+            object_name="secondaryActionCard",
+            icon_name="image",
+            icon_color="#6B7280",
+            title="测试截图和翻译",
+            subtitle="用于测试 OCR 与翻译效果",
+            tone_css=self._get_quick_action_button_base_css("neutral"),
+        )
         self.test_button.clicked.connect(self.test_translation)
-        control_layout.addWidget(self.test_button)
+        control_layout.addWidget(self.test_button, 1, 1)
         
         control_group.setLayout(control_layout)
         self._view_main_layout.addWidget(control_group)
@@ -1677,52 +2652,95 @@ class MainWindow(QMainWindow):
             self.test_button.setEnabled(False)
         
         # 4. 设置区域
-        settings_group = QGroupBox("设置")
-        settings_layout = QVBoxLayout()
+        settings_row = QHBoxLayout()
+        settings_row.setSpacing(self._scale_size(16))
+        language_group = QGroupBox("")
+        try:
+            language_group.setObjectName("settingsPanel")
+        except Exception:
+            pass
+        language_layout = QVBoxLayout()
+        language_layout.setSpacing(self._scale_size(12))
+        lang_header = QHBoxLayout()
+        lang_icon = QLabel()
+        lang_icon.setPixmap(self._make_line_icon("globe", "#4B5563").pixmap(QSize(self._scale_size(22), self._scale_size(22))))
+        lang_header.addWidget(lang_icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        lang_title = QLabel("语言设置")
+        lang_title.setObjectName("panelHeaderTitle")
+        lang_header.addWidget(lang_title, 0, Qt.AlignmentFlag.AlignVCenter)
+        lang_header.addStretch()
+        language_layout.addLayout(lang_header)
         
         # 语言设置
-        lang_layout = QHBoxLayout()
-        lang_layout.addWidget(QLabel("源语言:"))
+        language_layout.addWidget(QLabel("源语言"))
         
         self.source_lang_combo = QComboBox()
-        self.source_lang_combo.setMinimumWidth(self._scale_size(200))  # 设置下拉框宽度为200像素
+        self.source_lang_combo.setMinimumWidth(self._scale_size(220))
         self.source_lang_combo.currentIndexChanged.connect(self._on_source_lang_combo_changed)
-        lang_layout.addWidget(self.source_lang_combo)
+        language_layout.addWidget(self.source_lang_combo)
         
-        lang_layout.addWidget(QLabel("目标语言:"))
+        language_layout.addWidget(QLabel("目标语言"))
         
         self.target_lang_combo = QComboBox()
-        self.target_lang_combo.setMinimumWidth(self._scale_size(200))  # 设置下拉框宽度为200像素
+        self.target_lang_combo.setMinimumWidth(self._scale_size(220))
         self.target_lang_combo.currentIndexChanged.connect(self._on_target_lang_combo_changed)
-        lang_layout.addWidget(self.target_lang_combo)
-        
-        settings_layout.addLayout(lang_layout)
+        language_layout.addWidget(self.target_lang_combo)
 
         # 构建语言下拉框（主界面仍只显示 4 个快捷语言槽位 + "显示更多…"）
         self._rebuild_language_combos(apply_config_selection=True)
         
+        language_group.setLayout(language_layout)
+        settings_row.addWidget(language_group, 1)
+
+        ocr_group = QGroupBox("")
+        try:
+            ocr_group.setObjectName("settingsPanel")
+        except Exception:
+            pass
+        settings_layout = QVBoxLayout()
+        settings_layout.setSpacing(self._scale_size(12))
+        ocr_header = QHBoxLayout()
+        ocr_icon = QLabel()
+        ocr_icon.setPixmap(self._make_line_icon("camera", "#4B5563").pixmap(QSize(self._scale_size(22), self._scale_size(22))))
+        ocr_header.addWidget(ocr_icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        ocr_title = QLabel("截图与 OCR")
+        ocr_title.setObjectName("panelHeaderTitle")
+        ocr_header.addWidget(ocr_title, 0, Qt.AlignmentFlag.AlignVCenter)
+        ocr_header.addStretch()
+        settings_layout.addLayout(ocr_header)
+
         # 快捷键设置
         hotkey_layout = QHBoxLayout()
-        hotkey_layout.addWidget(QLabel("截图快捷键:"))
+        hotkey_layout.addWidget(QLabel("截图快捷键"))
         
         self.hotkey_edit = QLineEdit()
-        self.hotkey_edit.setPlaceholderText("例如: b")
+        self.hotkey_edit.setPlaceholderText("例如：b")
         self.hotkey_edit.setText(self.config['hotkey'])
         self.hotkey_edit.editingFinished.connect(self.save_hotkey_setting)
-        hotkey_layout.addWidget(self.hotkey_edit)
+        hotkey_layout.addWidget(self.hotkey_edit, 1)
         
         settings_layout.addLayout(hotkey_layout)
 
-        self.keep_capture_region_check = QCheckBox("保留框选区域（框选一次，快捷键重复翻译）")
+        keep_region_row = QHBoxLayout()
+        self.keep_capture_region_check = _ToggleSwitch()
         self.keep_capture_region_check.setChecked(bool(self.config.get("keep_capture_region", False)))
         self.keep_capture_region_check.stateChanged.connect(self.save_keep_capture_region_setting)
-        settings_layout.addWidget(self.keep_capture_region_check)
+        keep_region_row.addWidget(self.keep_capture_region_check, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        keep_region_title = QLabel("保留框选区域")
+        keep_region_title.setObjectName("switchLabel")
+        keep_region_row.addWidget(keep_region_title, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        keep_region_hint = QLabel("框选一次，可重复快捷翻译")
+        keep_region_hint.setObjectName("fieldHint")
+        keep_region_row.addWidget(keep_region_hint, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        keep_region_row.addStretch()
+        settings_layout.addLayout(keep_region_row)
         
         # OCR设置
         ocr_layout = QVBoxLayout()
 
         # OCR 识别模式（两档）：识别文本模式 / 复杂背景模式
         ocr_mode_layout = QHBoxLayout()
+        ocr_mode_layout.setSpacing(self._scale_size(8))
         ocr_mode_layout.addWidget(QLabel("OCR识别模式:"))
 
         self.ocr_mode_combo = QComboBox()
@@ -1741,7 +2759,9 @@ class MainWindow(QMainWindow):
         # 复杂背景模式 (index=1) -> ocr_preprocess_enabled=True
         self.ocr_mode_combo.setCurrentIndex(1 if enabled else 0)
         self.ocr_mode_combo.currentIndexChanged.connect(self.save_ocr_settings)
-        ocr_mode_layout.addWidget(self.ocr_mode_combo)
+        self.ocr_mode_combo.setMaximumWidth(self._scale_size(280))
+        ocr_mode_layout.addWidget(self.ocr_mode_combo, 0, Qt.AlignmentFlag.AlignLeft)
+        ocr_mode_layout.addStretch()
 
         ocr_layout.addLayout(ocr_mode_layout)
         
@@ -1760,17 +2780,19 @@ class MainWindow(QMainWindow):
         core_color_layout.addWidget(self.ocr_core_color_edit)
 
         self.ocr_core_color_preview = QLabel()
-        self.ocr_core_color_preview.setFixedSize(self._scale_size(36), self._scale_size(18))
+        self.ocr_core_color_preview.setFixedSize(self._scale_size(40), self._scale_size(32))
         self.ocr_core_color_preview.setToolTip("字芯颜色预览")
         core_color_layout.addWidget(self.ocr_core_color_preview)
 
-        self.ocr_core_color_pick_btn = QPushButton("选择字芯颜色…")
+        self.ocr_core_color_pick_btn = QPushButton("选择颜色")
         self.ocr_core_color_pick_btn.setToolTip("打开颜色选择器，设置字芯颜色")
+        self.ocr_core_color_pick_btn.setIcon(self._make_line_icon("camera", "#4B5563"))
         self.ocr_core_color_pick_btn.clicked.connect(self.choose_ocr_core_color)
         core_color_layout.addWidget(self.ocr_core_color_pick_btn)
 
         self.ocr_core_color_dropper_btn = QPushButton("吸管")
         self.ocr_core_color_dropper_btn.setToolTip("从屏幕上取色（点击取色，ESC/右键取消）")
+        self.ocr_core_color_dropper_btn.setIcon(self._make_line_icon("target", "#4B5563"))
         self.ocr_core_color_dropper_btn.clicked.connect(self.pick_ocr_core_color_with_eyedropper)
         core_color_layout.addWidget(self.ocr_core_color_dropper_btn)
 
@@ -1782,44 +2804,85 @@ class MainWindow(QMainWindow):
             pass
         
         settings_layout.addLayout(ocr_layout)
+        ocr_group.setLayout(settings_layout)
+        settings_row.addWidget(ocr_group, 2)
+        self._view_main_layout.addLayout(settings_row)
         
         # 悬浮窗设置
+        overlay_group = QGroupBox("")
+        try:
+            overlay_group.setObjectName("settingsPanel")
+        except Exception:
+            pass
+        settings_layout = QVBoxLayout()
+        settings_layout.setSpacing(self._scale_size(14))
+        overlay_header = QHBoxLayout()
+        overlay_icon = QLabel()
+        overlay_icon.setPixmap(self._make_line_icon("window", "#4B5563").pixmap(QSize(self._scale_size(22), self._scale_size(22))))
+        overlay_header.addWidget(overlay_icon, 0, Qt.AlignmentFlag.AlignVCenter)
+        overlay_title = QLabel("悬浮窗显示")
+        overlay_title.setObjectName("panelHeaderTitle")
+        overlay_header.addWidget(overlay_title, 0, Qt.AlignmentFlag.AlignVCenter)
+        overlay_header.addStretch()
+        settings_layout.addLayout(overlay_header)
         overlay_layout = QVBoxLayout()
         
         opacity_layout = QHBoxLayout()
-        opacity_layout.addWidget(QLabel("悬浮窗透明度:"))
+        opacity_layout.addWidget(QLabel("悬浮窗透明度"))
         
+        self.opacity_slider = QSlider(Qt.Orientation.Horizontal)
+        self.opacity_slider.setRange(10, 100)
+        self.opacity_slider.setValue(int(round(float(self.config['overlay_opacity']) * 100)))
+        opacity_layout.addWidget(self.opacity_slider, 1)
+
         self.opacity_spin = QDoubleSpinBox()
         self.opacity_spin.setRange(0.1, 1.0)
         self.opacity_spin.setSingleStep(0.1)
         self.opacity_spin.setValue(self.config['overlay_opacity'])
+        self.opacity_spin.setFixedWidth(self._scale_size(80))
         self.opacity_spin.valueChanged.connect(self.save_overlay_settings)
+        self.opacity_spin.valueChanged.connect(lambda v: self.opacity_slider.setValue(int(round(float(v) * 100))))
+        self.opacity_slider.valueChanged.connect(lambda v: self.opacity_spin.setValue(round(float(v) / 100.0, 2)))
         opacity_layout.addWidget(self.opacity_spin)
         
         overlay_layout.addLayout(opacity_layout)
         
         timeout_layout = QHBoxLayout()
-        timeout_layout.addWidget(QLabel("显示时间(秒):"))
+        timeout_layout.addWidget(QLabel("显示时间（秒）"))
         
+        self.timeout_slider = QSlider(Qt.Orientation.Horizontal)
+        self.timeout_slider.setRange(5, 60)
+        self.timeout_slider.setValue(int(self.config['overlay_timeout']))
+        timeout_layout.addWidget(self.timeout_slider, 1)
+
         self.timeout_spin = QSpinBox()
         self.timeout_spin.setRange(5, 60)
         self.timeout_spin.setValue(self.config['overlay_timeout'])
+        self.timeout_spin.setFixedWidth(self._scale_size(80))
         self.timeout_spin.valueChanged.connect(self.save_overlay_settings)
+        self.timeout_spin.valueChanged.connect(self.timeout_slider.setValue)
+        self.timeout_slider.valueChanged.connect(self.timeout_spin.setValue)
         timeout_layout.addWidget(self.timeout_spin)
         
         overlay_layout.addLayout(timeout_layout)
         
-        self.auto_hide_check = QCheckBox("自动隐藏悬浮窗")
+        auto_hide_row = QHBoxLayout()
+        self.auto_hide_check = _ToggleSwitch()
         self.auto_hide_check.setChecked(self.config['overlay_auto_hide'])
         self.auto_hide_check.stateChanged.connect(self.save_overlay_settings)
-        overlay_layout.addWidget(self.auto_hide_check)
+        auto_hide_row.addWidget(self.auto_hide_check, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        auto_hide_label = QLabel("自动隐藏悬浮窗")
+        auto_hide_label.setObjectName("switchLabel")
+        auto_hide_row.addWidget(auto_hide_label, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        auto_hide_row.addStretch()
+        overlay_layout.addLayout(auto_hide_row)
 
         # 说明：字芯颜色用于复杂背景模式下的识别增强
         
         settings_layout.addLayout(overlay_layout)
         
-        settings_group.setLayout(settings_layout)
-        self._view_main_layout.addWidget(settings_group)
+        overlay_group.setLayout(settings_layout)
+        self._view_main_layout.addWidget(overlay_group)
 
         self._view_main_layout.addStretch()
         
@@ -1827,10 +2890,14 @@ class MainWindow(QMainWindow):
         button_layout = QHBoxLayout()
         
         self.save_button = QPushButton("保存设置")
+        self.save_button.setIcon(self._make_line_icon("save", "#3B82F6"))
+        self.save_button.setIconSize(QSize(self._scale_size(22), self._scale_size(22)))
         self.save_button.clicked.connect(self.save_all_settings)
         button_layout.addWidget(self.save_button)
         
         self.about_button = QPushButton("如何操作")
+        self.about_button.setIcon(self._make_line_icon("book", "#3B82F6"))
+        self.about_button.setIconSize(QSize(self._scale_size(22), self._scale_size(22)))
         self.about_button.clicked.connect(self.show_how_to)
         button_layout.addWidget(self.about_button)
 
@@ -1847,14 +2914,13 @@ class MainWindow(QMainWindow):
                 self.installer = None
         
         self.quit_button = QPushButton("退出")
+        self.quit_button.setIcon(self._make_line_icon("power", "#EF4444"))
+        self.quit_button.setIconSize(QSize(self._scale_size(22), self._scale_size(22)))
         self.quit_button.clicked.connect(self.close)
         button_layout.addWidget(self.quit_button)
         
         self._view_main_layout.addLayout(button_layout)
         
-        # 添加弹性空间
-        self._view_status_layout.addStretch()
-
         log_group = QGroupBox("历史记录")
         self._history_group = log_group
         log_layout = QVBoxLayout()
@@ -1873,7 +2939,6 @@ class MainWindow(QMainWindow):
 
         log_group.setLayout(log_layout)
         self._view_history_layout.addWidget(log_group, 1)
-        self._view_history_layout.addStretch()
 
         hook_group = QGroupBox("Hook模式（系统钩子/外部钩子）")
         hook_layout = QVBoxLayout()
@@ -1917,12 +2982,18 @@ class MainWindow(QMainWindow):
         intercept_layout = QVBoxLayout()
 
         intercept_top = QHBoxLayout()
-        self.hook_realtime_translate_checkbox = QCheckBox("实时翻译")
+        hook_realtime_label = QLabel("实时翻译")
+        intercept_top.addWidget(hook_realtime_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        self.hook_realtime_translate_checkbox = _ToggleSwitch()
         try:
             self.hook_realtime_translate_checkbox.setChecked(True)
         except Exception:
             pass
-        intercept_top.addWidget(self.hook_realtime_translate_checkbox)
+        try:
+            self.hook_realtime_translate_checkbox.setFixedSize(self._scale_size(50), self._scale_size(30))
+        except Exception:
+            pass
+        intercept_top.addWidget(self.hook_realtime_translate_checkbox, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.hook_translate_selected_button = QPushButton("翻译选中")
         self.hook_translate_selected_button.clicked.connect(self._hook_translate_selected_text)
@@ -1957,7 +3028,6 @@ class MainWindow(QMainWindow):
 
         hook_group.setLayout(hook_layout)
         self._view_hook_layout.addWidget(hook_group, 1)
-        self._view_hook_layout.addStretch()
 
         glossary_group = QGroupBox("翻译词库")
         glossary_layout = QVBoxLayout()
@@ -1988,7 +3058,6 @@ class MainWindow(QMainWindow):
 
         glossary_group.setLayout(glossary_layout)
         self._view_glossary_layout.addWidget(glossary_group, 1)
-        self._view_glossary_layout.addStretch()
 
         reuse_group = QGroupBox("智能复用")
         reuse_layout = QVBoxLayout()
@@ -2011,7 +3080,7 @@ class MainWindow(QMainWindow):
         self.translation_reuse_db_path_label.hide()
 
         reuse_toggle_row = QHBoxLayout()
-        self.translation_reuse_enabled_check = QCheckBox("启用智能复用")
+        self.translation_reuse_enabled_check = _ToggleSwitch()
         try:
             self.translation_reuse_enabled_check.setChecked(
                 bool(self.config_manager.get_bool("translation", "reuse_enabled", True))
@@ -2019,7 +3088,10 @@ class MainWindow(QMainWindow):
         except Exception:
             self.translation_reuse_enabled_check.setChecked(True)
         self.translation_reuse_enabled_check.stateChanged.connect(self._save_translation_reuse_enabled_setting)
-        reuse_toggle_row.addWidget(self.translation_reuse_enabled_check)
+        reuse_toggle_row.addWidget(self.translation_reuse_enabled_check, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.translation_reuse_enabled_label = QLabel("启用智能复用")
+        self.translation_reuse_enabled_label.setObjectName("switchLabel")
+        reuse_toggle_row.addWidget(self.translation_reuse_enabled_label, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         reuse_toggle_row.addStretch()
 
         self.translation_reuse_total_label = QLabel("总共 0 条")
@@ -2052,6 +3124,8 @@ class MainWindow(QMainWindow):
         self.translation_reuse_table.setColumnCount(6)
         self.translation_reuse_table.setHorizontalHeaderLabels(["源文", "译文", "源语言", "目标语言", "更新时间", "操作"])
         try:
+            self.translation_reuse_table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            self.translation_reuse_table.setMinimumWidth(0)
             self.translation_reuse_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
             self.translation_reuse_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
             self.translation_reuse_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -2074,6 +3148,7 @@ class MainWindow(QMainWindow):
             header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
             header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
             header.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+            header.setStretchLastSection(False)
         except Exception:
             pass
         try:
@@ -2122,7 +3197,8 @@ class MainWindow(QMainWindow):
         self._view_reuse_layout.addWidget(reuse_detail_group, 1)
         reuse_detail_group.hide()
         reuse_group.setLayout(reuse_layout)
-        self._view_reuse_layout.addStretch()
+
+        self.how_to_window = None
 
         try:
             self._view_status.hide()
@@ -2130,6 +3206,10 @@ class MainWindow(QMainWindow):
             self._view_hook.hide()
             self._view_glossary.hide()
             self._view_reuse.hide()
+        except Exception:
+            pass
+        try:
+            self._set_active_view("main")
         except Exception:
             pass
 
@@ -2145,6 +3225,10 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._install_main_page_effects()
+        try:
+            self._refresh_system_status()
+        except Exception:
+            pass
 
     def show_system_status_dialog(self) -> None:
         try:
@@ -2270,22 +3354,51 @@ class MainWindow(QMainWindow):
             return
         try:
             header = table.horizontalHeader()
-            lang_src_w = max(self._scale_size(92), header.sectionSize(2))
-            lang_tgt_w = max(self._scale_size(92), header.sectionSize(3))
-            updated_w = max(self._scale_size(148), header.sectionSize(4))
-            action_w = max(self._scale_size(84), header.sectionSize(5))
+            lang_src_w = self._scale_size(96)
+            lang_tgt_w = self._scale_size(96)
+            updated_w = self._scale_size(156)
+            action_w = self._scale_size(84)
+            try:
+                table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            except Exception:
+                pass
         except Exception:
             lang_src_w = self._scale_size(92)
             lang_tgt_w = self._scale_size(92)
             updated_w = self._scale_size(148)
             action_w = self._scale_size(84)
 
-        remaining = max(
-            self._scale_size(320),
-            viewport_width - lang_src_w - lang_tgt_w - updated_w - action_w - self._scale_size(16),
-        )
-        src_w = max(self._scale_size(200), int(remaining * 0.5))
-        tgt_w = max(self._scale_size(200), remaining - src_w)
+        fixed_total = lang_src_w + lang_tgt_w + updated_w + action_w
+        min_text_w = self._scale_size(130)
+        if viewport_width - fixed_total < min_text_w * 2:
+            overflow = min_text_w * 2 - (viewport_width - fixed_total)
+            updated_w = max(self._scale_size(110), updated_w - int(overflow * 0.55))
+            lang_src_w = max(self._scale_size(70), lang_src_w - int(overflow * 0.18))
+            lang_tgt_w = max(self._scale_size(70), lang_tgt_w - int(overflow * 0.18))
+            action_w = max(self._scale_size(70), action_w - int(overflow * 0.09))
+            fixed_total = lang_src_w + lang_tgt_w + updated_w + action_w
+        remaining = max(min_text_w * 2, viewport_width - fixed_total)
+        src_w = max(min_text_w, int(remaining * 0.50))
+        tgt_w = max(min_text_w, viewport_width - fixed_total - src_w)
+        if tgt_w < min_text_w:
+            tgt_w = min_text_w
+            src_w = max(min_text_w, viewport_width - fixed_total - tgt_w)
+
+        total_w = src_w + tgt_w + lang_src_w + lang_tgt_w + updated_w + action_w
+        delta = viewport_width - total_w
+        if delta:
+            if delta > 0:
+                tgt_w += delta
+            else:
+                shrink = -delta
+                take_tgt = min(max(0, tgt_w - min_text_w), int(shrink * 0.55))
+                tgt_w -= take_tgt
+                shrink -= take_tgt
+                take_src = min(max(0, src_w - min_text_w), shrink)
+                src_w -= take_src
+                shrink -= take_src
+                if shrink > 0:
+                    updated_w = max(self._scale_size(96), updated_w - shrink)
 
         try:
             table.setColumnWidth(0, src_w)
@@ -2294,6 +3407,13 @@ class MainWindow(QMainWindow):
             table.setColumnWidth(3, lang_tgt_w)
             table.setColumnWidth(4, updated_w)
             table.setColumnWidth(5, action_w)
+            try:
+                actual_total = int(table.horizontalHeader().length() or 0)
+            except Exception:
+                actual_total = src_w + tgt_w + lang_src_w + lang_tgt_w + updated_w + action_w
+            final_delta = viewport_width - actual_total
+            if final_delta:
+                table.setColumnWidth(1, max(min_text_w, int(table.columnWidth(1) + final_delta)))
         except Exception:
             pass
 
@@ -2780,7 +3900,7 @@ class MainWindow(QMainWindow):
             v = "main"
 
         try:
-            self._view_main.setVisible(v == "main")
+            self._view_main_scroll.setVisible(v == "main")
         except Exception:
             pass
         try:
@@ -2803,7 +3923,6 @@ class MainWindow(QMainWindow):
             self._view_reuse.setVisible(v == "reuse")
         except Exception:
             pass
-
         try:
             act = self._hero_menu_actions.get("main")
             if act is not None:
@@ -2823,10 +3942,79 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        try:
+            for key, btn in getattr(self, "_nav_buttons", {}).items():
+                active = key == v
+                btn.setChecked(active)
+                icon_name = str(btn.property("nav_icon") or "")
+                btn.setIcon(self._make_line_icon(icon_name, "#FFFFFF" if active else "#64748B"))
+        except Exception:
+            pass
+
     def _apply_main_page_theme(self, root: QWidget) -> None:
         css = """
             #mainRoot {
-                background-color: #F6F7FB;
+                background-color: #F4F8FB;
+            }
+
+            #mainRoot #sidebar,
+            #mainRoot #contentShell {
+                background-color: rgba(255, 255, 255, 0.92);
+                border: 1px solid rgba(15, 23, 42, 0.08);
+                border-radius: 16px;
+            }
+
+            #mainRoot #brandTitle {
+                color: #0F172A;
+                font-size: 18px;
+                font-weight: 800;
+            }
+            #mainRoot #brandSubtitle {
+                color: #64748B;
+                font-size: 13px;
+            }
+            #mainRoot QToolButton#sidebarNavButton {
+                background-color: transparent;
+                border: 0px;
+                border-radius: 8px;
+                color: #64748B;
+                padding: 10px 12px;
+            }
+            #mainRoot QToolButton#sidebarNavButton:hover {
+                background-color: rgba(59, 130, 246, 0.08);
+                color: #475569;
+            }
+            #mainRoot QToolButton#sidebarNavButton:checked {
+                background-color: #3B82F6;
+                color: #FFFFFF;
+            }
+
+            #mainRoot #sidebarStatus {
+                background-color: rgba(255, 255, 255, 0.78);
+                border: 1px solid rgba(15, 23, 42, 0.08);
+                border-radius: 10px;
+            }
+            #mainRoot #sidebarSectionTitle {
+                color: #0F172A;
+                font-size: 13px;
+                font-weight: 800;
+            }
+            #mainRoot #sidebarOk {
+                color: #16A34A;
+                font-size: 12px;
+            }
+            #mainRoot #sidebarStatusName,
+            #mainRoot #sidebarResourceName {
+                color: #64748B;
+                font-size: 12px;
+            }
+            #mainRoot #sidebarStatusValue {
+                color: #64748B;
+                font-size: 12px;
+            }
+            #mainRoot #sidebarDivider {
+                color: rgba(15, 23, 42, 0.08);
+                background-color: rgba(15, 23, 42, 0.08);
             }
 
             #mainRoot #heroHeader {
@@ -2842,18 +4030,56 @@ class MainWindow(QMainWindow):
                 font-size: 12px;
             }
 
+            #mainRoot #homePageTitle {
+                color: #0F172A;
+                font-size: 28px;
+                font-weight: 900;
+                padding-top: 4px;
+            }
+            #mainRoot #homePageSubtitle {
+                color: #8A94A6;
+                font-size: 15px;
+                padding-bottom: 8px;
+            }
+            #mainRoot #panelHeaderTitle {
+                color: #111827;
+                font-size: 15px;
+                font-weight: 800;
+            }
+            #mainRoot #switchLabel {
+                color: #4B5563;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            #mainRoot #fieldHint {
+                color: #A0A8B8;
+                font-size: 12px;
+            }
+            #mainRoot #actionCardTitle {
+                font-size: 17px;
+                font-weight: 800;
+                color: #111827;
+            }
+            #mainRoot #actionCardSubtitle {
+                font-size: 13px;
+                color: #8B95A7;
+            }
+
             #mainRoot QGroupBox {
-                background-color: rgba(255, 255, 255, 0.92);
-                border: 1px solid rgba(17, 24, 39, 0.08);
-                border-radius: 14px;
-                margin-top: 12px;
+                background-color: rgba(255, 255, 255, 0.82);
+                border: 1px solid rgba(15, 23, 42, 0.07);
+                border-radius: 18px;
+                margin-top: 10px;
             }
             #mainRoot QGroupBox::title {
                 subcontrol-origin: margin;
-                left: 14px;
+                left: 18px;
                 padding: 0px 6px;
-                color: rgba(17, 24, 39, 0.72);
-                font-weight: 600;
+                color: #0F172A;
+                font-weight: 800;
+                font-size: 15px;
+                height: 0px;
+                color: transparent;
             }
 
             #mainRoot QLabel {
@@ -2863,9 +4089,19 @@ class MainWindow(QMainWindow):
 
             #mainRoot QPushButton {
                 background-color: rgba(255, 255, 255, 0.96);
-                border: 1px solid rgba(17, 24, 39, 0.10);
+                border: 1px solid rgba(15, 23, 42, 0.10);
                 border-radius: 12px;
-                padding: 10px 12px;
+                padding: 8px 12px;
+                color: #334155;
+            }
+            #mainRoot #primaryActionCard,
+            #mainRoot #secondaryActionCard,
+            #mainRoot #hookModeButton {
+                text-align: left;
+                padding: 0px;
+                border-radius: 18px;
+                font-size: 14px;
+                font-weight: 800;
             }
             #mainRoot QPushButton:hover {
                 background-color: #FFFFFF;
@@ -2882,38 +4118,95 @@ class MainWindow(QMainWindow):
             }
 
             #mainRoot #hookModeButton {
-                background-color: #3B82F6;
-                border-color: rgba(37, 99, 235, 0.40);
-                color: #FFFFFF;
-                font-weight: 700;
+                background-color: rgba(242, 248, 255, 0.98);
+                border-color: rgba(96, 165, 250, 0.42);
+                color: #2563EB;
+                font-weight: 800;
+                font-size: 14px;
+                text-align: left;
+                padding: 0px;
+                border-radius: 18px;
             }
             #mainRoot #hookModeButton:hover {
-                background-color: #2563EB;
-                border-color: rgba(37, 99, 235, 0.55);
+                background-color: #FFFFFF;
+                border-color: rgba(59, 130, 246, 0.62);
             }
             #mainRoot #hookModeButton:pressed {
-                background-color: #1D4ED8;
-                border-color: rgba(29, 78, 216, 0.65);
+                background-color: rgba(219, 234, 254, 0.96);
+                border-color: rgba(37, 99, 235, 0.70);
             }
             #mainRoot #hookModeButton:disabled {
-                background-color: rgba(59, 130, 246, 0.40);
-                border-color: rgba(37, 99, 235, 0.22);
-                color: rgba(255, 255, 255, 0.78);
+                background-color: rgba(242, 248, 255, 0.66);
+                border-color: rgba(96, 165, 250, 0.20);
+                color: rgba(37, 99, 235, 0.46);
             }
 
             #mainRoot QLineEdit,
             #mainRoot QComboBox,
             #mainRoot QSpinBox,
             #mainRoot QDoubleSpinBox,
-            #mainRoot QTextEdit {
-                background-color: rgba(255, 255, 255, 0.96);
-                border: 1px solid rgba(17, 24, 39, 0.10);
+            #mainRoot QTextEdit,
+            #mainRoot QListWidget {
+                background-color: #FFFFFF;
+                border: 1px solid rgba(226, 232, 240, 1.0);
                 border-radius: 12px;
-                padding: 8px 10px;
+                padding: 7px 12px;
                 selection-background-color: #C7D2FE;
+                min-height: 18px;
+                font-size: 14px;
             }
             #mainRoot QTextEdit {
                 padding: 10px;
+            }
+            #mainRoot QComboBox {
+                padding-right: 28px;
+            }
+            #mainRoot QComboBox::drop-down {
+                border: 0px;
+                width: 26px;
+                subcontrol-origin: padding;
+                subcontrol-position: top right;
+            }
+            #mainRoot QComboBox::down-arrow {
+                width: 8px;
+                height: 8px;
+                border-right: 2px solid #6B7280;
+                border-bottom: 2px solid #6B7280;
+                margin-right: 6px;
+                margin-top: -2px;
+                transform: rotate(45deg);
+            }
+            #mainRoot QComboBox:hover,
+            #mainRoot QLineEdit:hover,
+            #mainRoot QSpinBox:hover,
+            #mainRoot QDoubleSpinBox:hover {
+                border-color: rgba(203, 213, 225, 1.0);
+            }
+            #mainRoot QComboBox:focus,
+            #mainRoot QLineEdit:focus,
+            #mainRoot QSpinBox:focus,
+            #mainRoot QDoubleSpinBox:focus {
+                border-color: rgba(96, 165, 250, 0.8);
+            }
+            #mainRoot QCheckBox {
+                spacing: 10px;
+                font-weight: 600;
+            }
+            #mainRoot QCheckBox::indicator {
+                width: 36px;
+                height: 22px;
+                border-radius: 11px;
+                border: 1px solid rgba(203, 213, 225, 1.0);
+                background: #D9DEE8;
+            }
+            #mainRoot QCheckBox::indicator:checked {
+                background: #4ECB7C;
+                border-color: #4ECB7C;
+            }
+            #mainRoot _ToggleSwitch {
+                background: transparent;
+                border: 0px;
+                padding: 0px;
             }
 
             #mainRoot QTableWidget {
@@ -2930,12 +4223,29 @@ class MainWindow(QMainWindow):
                 border: 0px;
             }
             #mainRoot QHeaderView::section {
-                background-color: rgba(238, 242, 255, 0.82);
+                background-color: rgba(239, 246, 255, 0.86);
                 color: rgba(17, 24, 39, 0.72);
                 border: 0px;
                 border-bottom: 1px solid rgba(17, 24, 39, 0.08);
                 padding: 8px 10px;
                 font-weight: 600;
+            }
+
+            #mainRoot QSlider::groove:horizontal {
+                height: 3px;
+                background-color: #E2E8F0;
+                border-radius: 2px;
+            }
+            #mainRoot QSlider::sub-page:horizontal {
+                background-color: #3B82F6;
+                border-radius: 2px;
+            }
+            #mainRoot QSlider::handle:horizontal {
+                width: 16px;
+                height: 16px;
+                margin: -7px 0px;
+                border-radius: 8px;
+                background-color: #3B82F6;
             }
             #mainRoot QTableCornerButton::section {
                 background-color: rgba(238, 242, 255, 0.82);
@@ -3012,6 +4322,10 @@ class MainWindow(QMainWindow):
             header = root.findChild(QFrame, "heroHeader")
             if header is not None:
                 self._main_page_card_targets.append((header, 22, 8, 28))
+            for name in ("sidebar", "contentShell", "sidebarStatus"):
+                frame = root.findChild(QFrame, name)
+                if frame is not None:
+                    self._main_page_card_targets.append((frame, 20, 7, 24))
         except Exception:
             pass
 
@@ -3365,7 +4679,7 @@ class MainWindow(QMainWindow):
         """
         每秒刷新一次（以及进度/完成时触发）：
         - 组件状态（Tesseract / OCR / 模型）
-        - 资源占用（进程内存/CPU，GPU 显存）
+        - 资源占用（内存/CPU，GPU 显存）
         """
         rm = None
         try:
@@ -3380,18 +4694,27 @@ class MainWindow(QMainWindow):
             ps = None
             gs = None
 
-        # 进程资源
+        # 资源占用
         try:
             if ps is not None:
                 mem = rm.format_bytes(ps.rss_bytes) if rm is not None else "-"
                 cpu = "-" if ps.cpu_percent is None else f"{ps.cpu_percent:.1f}%"
-                gpu_part = ""
+                gpu_value = "-"
+                gpu_bytes = 0
                 if gs is not None and gs.available:
                     alloc = rm.format_bytes(gs.allocated_bytes) if rm is not None else "-"
-                    resv = rm.format_bytes(gs.reserved_bytes) if rm is not None else "-"
                     total = rm.format_bytes(gs.total_bytes) if rm is not None else "-"
-                    gpu_part = f" | GPU: {alloc} 已分配 / {resv} 已保留 / {total} 总计"
-                self.process_resource_label.setText(f"进程资源: 内存 {mem} | CPU {cpu}{gpu_part}")
+                    gpu_value = f"{alloc} 已分配 / {total} 总显存"
+                    try:
+                        gpu_bytes = float(gs.allocated_bytes or 0)
+                    except Exception:
+                        gpu_bytes = 0
+                self.process_resource_label.setText(f"资源占用: 内存 {mem} | 显存 {gpu_value} | CPU {cpu}")
+                try:
+                    if hasattr(self, "resource_chart") and self.resource_chart is not None:
+                        self.resource_chart.add_sample(ps.rss_bytes, gpu_bytes)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -3452,16 +4775,6 @@ class MainWindow(QMainWindow):
             cpu_now = "-"
 
         try:
-            ocr_delta = self._component_stats.get("ocr", {}).get("rss_delta_bytes")
-            ocr_delta_s = (rm.format_bytes(ocr_delta) if (rm is not None and ocr_delta) else "-")
-            if gs is None or not getattr(gs, "available", False):
-                self.ocr_resource_label.setText(f"OCR资源: 内存Δ {ocr_delta_s} | CPU {cpu_now}")
-            else:
-                self.ocr_resource_label.setText(f"OCR资源: 内存Δ {ocr_delta_s}")
-        except Exception:
-            pass
-
-        try:
             if bool(getattr(self, "_local_model_missing", False)):
                 self.model_resource_label.setText("模型资源: 不可用")
             elif not bool(getattr(self, "_api_enabled", False)):
@@ -3469,32 +4782,47 @@ class MainWindow(QMainWindow):
                     self.model_resource_label.setText("模型资源: 不可用")
                 else:
                     tstats = self._component_stats.get("translator", {}) or {}
-                    rss_d = tstats.get("rss_delta_bytes")
-                    rss_s = (rm.format_bytes(rss_d) if (rm is not None and rss_d) else "-")
                     if gs is None or not getattr(gs, "available", False):
-                        self.model_resource_label.setText(f"模型资源: 内存Δ {rss_s} | CPU {cpu_now}")
+                        self.model_resource_label.setText(f"模型资源: 显存不可用 | CPU {cpu_now}")
                     else:
                         ga = tstats.get("gpu_allocated_delta_bytes")
                         gr = tstats.get("gpu_reserved_delta_bytes")
                         ga_s = (rm.format_bytes(ga) if (rm is not None and ga) else "-")
                         gr_s = (rm.format_bytes(gr) if (rm is not None and gr) else "-")
-                        self.model_resource_label.setText(f"模型资源: 内存Δ {rss_s} | 显存Δ {ga_s} 已分配 / {gr_s} 已保留")
+                        self.model_resource_label.setText(f"模型资源: 显存Δ {ga_s} 已分配 / {gr_s} 已保留")
         except Exception:
             pass
 
+        self._refresh_sidebar_status()
+
     def update_translate_button_label(self):
         """根据当前状态和快捷键更新启动/停止按钮文本"""
-        hotkey = self.config.get('hotkey', 'b')
+        subtitle_idle = "开始屏幕识别与实时翻译"
+        subtitle_running = "停止屏幕翻译与实时翻译"
         if bool(getattr(self, "_api_enabled", False)):
             if not bool(str(getattr(self, "_api_base_url", "") or "").strip()):
-                self.translate_button.setText(f"请先填写BaseURL (快捷键: {hotkey})")
+                self._set_home_action_card_text(
+                    self.translate_button,
+                    title="请先填写 BaseURL",
+                    subtitle=subtitle_idle,
+                    title_color="#49C97E",
+                    subtitle_color="#8B95A7",
+                )
+                self._set_home_action_card_icon(self.translate_button, icon_name="play", icon_color="#49C97E")
                 try:
                     self.translate_button.setEnabled(False)
                 except Exception:
                     pass
                 return
             if not bool(str(getattr(self, "_api_model", "") or "").strip()):
-                self.translate_button.setText(f"请先添加并选择模型 (快捷键: {hotkey})")
+                self._set_home_action_card_text(
+                    self.translate_button,
+                    title="请先添加并选择模型",
+                    subtitle=subtitle_idle,
+                    title_color="#49C97E",
+                    subtitle_color="#8B95A7",
+                )
+                self._set_home_action_card_icon(self.translate_button, icon_name="play", icon_color="#49C97E")
                 try:
                     self.translate_button.setEnabled(False)
                 except Exception:
@@ -3503,21 +4831,47 @@ class MainWindow(QMainWindow):
         if not self._components_ready_for_work():
             hint = self._init_progress_text or "初始化中"
             if bool(getattr(self, "_local_model_missing", False)):
-                self.translate_button.setText(f"未检测到本地模型 (快捷键: {hotkey})")
+                title = "未检测到本地模型"
             elif "失败" in hint:
-                self.translate_button.setText(f"{hint} (快捷键: {hotkey})")
+                title = str(hint)
             else:
-                self.translate_button.setText("翻译器正在初始化…")
+                title = "翻译器正在初始化"
+            self._set_home_action_card_text(
+                self.translate_button,
+                title=title,
+                subtitle=subtitle_idle,
+                title_color="#49C97E",
+                subtitle_color="#8B95A7",
+            )
+            self._set_home_action_card_icon(self.translate_button, icon_name="play", icon_color="#49C97E")
             try:
                 self.translate_button.setEnabled(False)
             except Exception:
                 pass
             return
         if not self.is_translating and (not self._screenshot_translation_allowed_by_language()):
-            self.translate_button.setText(f"请先设置语言(快捷键: {hotkey})")
+            self._set_home_action_card_text(
+                self.translate_button,
+                title="请先设置语言",
+                subtitle=subtitle_idle,
+                title_color="#E45858",
+                subtitle_color="#8B95A7",
+            )
+            self._set_home_action_card_icon(self.translate_button, icon_name="power", icon_color="#E45858")
         else:
             state_text = "停止翻译" if self.is_translating else "启动翻译"
-            self.translate_button.setText(f"{state_text} (快捷键: {hotkey})")
+            self._set_home_action_card_text(
+                self.translate_button,
+                title=state_text,
+                subtitle=subtitle_running if self.is_translating else subtitle_idle,
+                title_color="#E45858" if self.is_translating else "#49C97E",
+                subtitle_color="#8B95A7",
+            )
+            self._set_home_action_card_icon(
+                self.translate_button,
+                icon_name="power" if self.is_translating else "play",
+                icon_color="#E45858" if self.is_translating else "#49C97E",
+            )
         try:
             if self.is_translating:
                 self._set_scaled_stylesheet(self.translate_button, self._get_translate_button_base_css(active=True))
@@ -3529,8 +4883,10 @@ class MainWindow(QMainWindow):
                 self.translate_button.setEnabled(False)
             elif self.is_translating:
                 self.translate_button.setEnabled(True)
+            elif not self._screenshot_translation_allowed_by_language():
+                self.translate_button.setEnabled(True)
             else:
-                self.translate_button.setEnabled(bool(self._screenshot_translation_allowed_by_language()))
+                self.translate_button.setEnabled(True)
         except Exception:
             pass
 
@@ -3985,14 +5341,18 @@ class MainWindow(QMainWindow):
             running = False
 
         if running:
-            main_text = "Hook模式：运行中"
             start_text = "停止Hook模式"
         else:
-            main_text = "Hook模式"
-            start_text = "启动Hook模式"
+            start_text = "启动 Hook 模式"
 
         try:
-            self.hook_mode_button.setText(main_text)
+            self._set_home_action_card_text(
+                self.hook_mode_button,
+                title="Hook 模式",
+                subtitle="适配游戏与传统程序文本捕获",
+                title_color="#3B82F6",
+                subtitle_color="#8B95A7",
+            )
         except Exception:
             pass
         try:
@@ -6170,6 +7530,21 @@ class MainWindow(QMainWindow):
         box.addButton("知道了", QMessageBox.ButtonRole.AcceptRole)
         box.exec()
 
+    def show_how_to(self):
+        try:
+            if getattr(self, "how_to_window", None) is None:
+                self.how_to_window = HowToWindow(self._scale_size, self)
+        except Exception:
+            self.how_to_window = None
+        try:
+            if self.how_to_window is not None:
+                self.how_to_window.update_hotkey(str(self.config.get("hotkey", "b") or "b"))
+                self.how_to_window.show()
+                self.how_to_window.raise_()
+                self.how_to_window.activateWindow()
+        except Exception:
+            pass
+
     def _check_client_update(self):
         """检查客户端版本更新"""
         if getattr(self, "_force_update_active", False):
@@ -6725,32 +8100,268 @@ class MainWindow(QMainWindow):
         # 更新按钮上的快捷键信息
         self.update_translate_button_label()
 
+    def _api_provider_json_path(self) -> Path:
+        try:
+            config_dir = getattr(self.config_manager, "config_dir", None)
+            if config_dir:
+                return Path(config_dir) / "api_providers.json"
+        except Exception:
+            pass
+        return Path("config") / "api_providers.json"
+
+    def _read_api_providers_json(self) -> dict:
+        path = self._api_provider_json_path()
+        try:
+            if not path.exists():
+                return {"providers": {}}
+            import json
+            data = json.loads(path.read_text(encoding="utf-8") or "{}")
+            if not isinstance(data, dict):
+                return {"providers": {}}
+            providers = data.get("providers")
+            if not isinstance(providers, dict):
+                data["providers"] = {}
+            return data
+        except Exception:
+            return {"providers": {}}
+
+    def _write_api_providers_json(self, data: dict) -> None:
+        try:
+            path = self._api_provider_json_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            import json
+            path.write_text(json.dumps(data or {"providers": {}}, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _load_api_provider_state(self, provider_key: str) -> dict:
+        key = str(provider_key or "custom").strip() or "custom"
+        try:
+            data = self._read_api_providers_json()
+            state = data.get("providers", {}).get(key, {})
+            return dict(state) if isinstance(state, dict) else {}
+        except Exception:
+            return {}
+
+    def _current_api_provider_state(self) -> dict:
+        key = str(getattr(self, "_api_provider_key", "") or "custom").strip() or "custom"
+        preset_key, label, preset_type, preset_base = _api_provider_by_key(key)
+        base_url = str(getattr(self, "_api_base_url", "") or "").strip()
+        provider_type = _infer_api_provider_type(base_url or preset_base, getattr(self, "_api_provider_type", preset_type))
+        return {
+            "provider_key": preset_key,
+            "label": label,
+            "provider_type": provider_type,
+            "base_url": base_url,
+            "api_key": str(getattr(self, "_api_key", "") or ""),
+            "model": str(getattr(self, "_api_model", "") or "").strip(),
+            "models": [str(x).strip() for x in list(getattr(self, "_api_models", []) or []) if str(x).strip()],
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _save_current_api_provider_state(self) -> None:
+        try:
+            key = str(getattr(self, "_api_provider_key", "") or "custom").strip() or "custom"
+            data = self._read_api_providers_json()
+            providers = data.setdefault("providers", {})
+            if not isinstance(providers, dict):
+                providers = {}
+                data["providers"] = providers
+            providers[key] = self._current_api_provider_state()
+            self._write_api_providers_json(data)
+            try:
+                self.config_manager.set("api", "provider_key", key)
+                self.config_manager.set("api", "provider_type", str(getattr(self, "_api_provider_type", "") or "openai"))
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _persist_api_legacy_settings(self) -> None:
+        try:
+            self.config_manager.set("api", "provider_key", str(getattr(self, "_api_provider_key", "") or "custom"))
+            self.config_manager.set("api", "provider_type", str(getattr(self, "_api_provider_type", "") or "openai"))
+            self.config_manager.set("api", "base_url", str(getattr(self, "_api_base_url", "") or ""))
+            self.config_manager.set("api", "api_key", str(getattr(self, "_api_key", "") or ""))
+            self.config_manager.set("api", "model", str(getattr(self, "_api_model", "") or ""))
+            self._save_api_models_to_config()
+        except Exception:
+            pass
+
+    def _apply_api_provider_state(self, state: dict, *, update_widgets: bool = True, persist_legacy: bool = True) -> None:
+        key = str(state.get("provider_key") or getattr(self, "_api_provider_key", "") or "custom").strip() or "custom"
+        _preset_key, _label, preset_type, preset_base = _api_provider_by_key(key)
+        base_url = str(state.get("base_url") or preset_base or "").strip()
+        provider_type = _infer_api_provider_type(base_url, str(state.get("provider_type") or preset_type))
+        api_key = str(state.get("api_key") or "")
+        model = str(state.get("model") or "").strip()
+        models_raw = state.get("models")
+        models = [str(x).strip() for x in list(models_raw or []) if str(x).strip()] if isinstance(models_raw, list) else []
+        if model and model not in models:
+            models.append(model)
+
+        self._api_provider_key = key
+        self._api_provider_type = provider_type
+        self._api_base_url = base_url
+        self._api_key = api_key
+        self._api_model = model
+        self._api_models = models
+
+        if update_widgets:
+            try:
+                if hasattr(self, "api_base_url_edit") and self.api_base_url_edit is not None:
+                    self.api_base_url_edit.setText(base_url)
+            except Exception:
+                pass
+            try:
+                if hasattr(self, "api_key_edit") and self.api_key_edit is not None:
+                    self.api_key_edit.setText(api_key)
+            except Exception:
+                pass
+            try:
+                self._refresh_api_models_ui()
+            except Exception:
+                pass
+        if persist_legacy:
+            self._persist_api_legacy_settings()
+
+    def _refresh_api_translator_from_settings(self) -> None:
+        if self._api_enabled and str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
+            try:
+                self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, provider_type=self._api_provider_type, timeout_sec=30.0)
+                self.translator = self._api_translator
+            except Exception:
+                self._api_translator = None
+                self.translator = None
+        elif self._api_enabled:
+            self._api_translator = None
+            self.translator = None
+
     def _save_api_base_url_setting(self) -> None:
         try:
             base_url = str(self.api_base_url_edit.text() or "").strip()
         except Exception:
             base_url = ""
         self._api_base_url = base_url
+        self._api_provider_type = _infer_api_provider_type(base_url, self._api_provider_type)
         try:
             self.config_manager.set("api", "base_url", base_url)
+            self.config_manager.set("api", "provider_type", self._api_provider_type)
         except Exception:
             pass
+        self._save_current_api_provider_state()
         if self._api_enabled:
-            try:
-                if str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
-                    self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
-                    self.translator = self._api_translator
-                else:
-                    self._api_translator = None
-                    self.translator = None
-            except Exception:
-                self._api_translator = None
-                self.translator = None
+            self._refresh_api_translator_from_settings()
             try:
                 self.update_translate_button_label()
             except Exception:
                 pass
             self._start_api_provider_probe()
+
+    def _on_api_provider_preset_changed(self, index: int) -> None:
+        try:
+            data = self.api_provider_combo.itemData(int(index))
+        except Exception:
+            data = None
+        if not isinstance(data, dict):
+            return
+        try:
+            self._save_current_api_provider_state()
+        except Exception:
+            pass
+        provider_key = str(data.get("key") or "custom").strip() or "custom"
+        provider_type = str(data.get("provider_type") or "openai").strip()
+        base_url = str(data.get("base_url") or "").strip()
+        saved_state = self._load_api_provider_state(provider_key)
+        if not saved_state:
+            saved_state = {
+                "provider_key": provider_key,
+                "provider_type": provider_type,
+                "base_url": base_url,
+                "api_key": "",
+                "model": "",
+                "models": [],
+            }
+        else:
+            saved_state["provider_key"] = provider_key
+            saved_state.setdefault("provider_type", provider_type)
+            saved_state.setdefault("base_url", base_url)
+        self._apply_api_provider_state(saved_state, update_widgets=True, persist_legacy=True)
+        self._refresh_api_translator_from_settings()
+        try:
+            self.update_translate_button_label()
+            self._refresh_system_status()
+        except Exception:
+            pass
+        if self._api_enabled:
+            try:
+                self._start_api_provider_probe()
+            except Exception:
+                pass
+
+    def _fetch_api_models(self) -> None:
+        try:
+            if self._api_models_fetch_thread is not None and self._api_models_fetch_thread.isRunning():
+                return
+        except Exception:
+            pass
+        try:
+            self._save_api_base_url_setting()
+            self._save_api_key_setting()
+        except Exception:
+            pass
+        base_url = str(self._api_base_url or "").strip()
+        if not base_url:
+            QMessageBox.warning(self, "获取失败", "请先选择服务商或填写BaseURL。")
+            return
+        try:
+            self.api_model_fetch_button.setEnabled(False)
+            self.api_model_fetch_button.setText("获取中…")
+        except Exception:
+            pass
+        th = _ApiModelsFetchThread(
+            base_url=base_url,
+            api_key=str(self._api_key or "").strip(),
+            provider_type=str(self._api_provider_type or "openai"),
+            timeout_sec=12.0,
+        )
+        self._api_models_fetch_thread = th
+        th.models_finished.connect(self._on_api_models_fetched)
+        th.start()
+
+    def _on_api_models_fetched(self, ok: bool, models: list, message: str) -> None:
+        try:
+            self.api_model_fetch_button.setEnabled(True)
+            self.api_model_fetch_button.setText("自动获取模型")
+        except Exception:
+            pass
+        if not ok:
+            QMessageBox.warning(self, "获取模型失败", str(message or "获取失败"))
+            return
+        merged: list[str] = []
+        for model in list(models or []):
+            m = str(model or "").strip()
+            if m and m not in merged:
+                merged.append(m)
+        if not merged:
+            QMessageBox.warning(self, "获取模型失败", "没有读取到模型列表。")
+            return
+        self._api_models = merged
+        if not str(self._api_model or "").strip() or self._api_model not in self._api_models:
+            self._api_model = self._api_models[0]
+            try:
+                self.config_manager.set("api", "model", self._api_model)
+            except Exception:
+                pass
+        self._save_api_models_to_config()
+        self._save_current_api_provider_state()
+        self._refresh_api_models_ui()
+        try:
+            self.update_translate_button_label()
+            self._refresh_system_status()
+        except Exception:
+            pass
+        QMessageBox.information(self, "获取完成", str(message or f"已获取 {len(merged)} 个模型"))
 
     def _save_api_key_setting(self) -> None:
         try:
@@ -6762,13 +8373,9 @@ class MainWindow(QMainWindow):
             self.config_manager.set("api", "api_key", api_key)
         except Exception:
             pass
+        self._save_current_api_provider_state()
         if self._api_enabled:
-            try:
-                if str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
-                    self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
-                    self.translator = self._api_translator
-            except Exception:
-                pass
+            self._refresh_api_translator_from_settings()
             try:
                 self.update_translate_button_label()
             except Exception:
@@ -6784,6 +8391,10 @@ class MainWindow(QMainWindow):
                 self.config_manager.set("api", "models", "\n".join(list(self._api_models or [])))
             except Exception:
                 pass
+        try:
+            self._save_current_api_provider_state()
+        except Exception:
+            pass
 
     def _refresh_api_models_ui(self) -> None:
         try:
@@ -6807,15 +8418,16 @@ class MainWindow(QMainWindow):
                     label = QLabel(m)
                     row_layout.addWidget(label, 1)
                     del_btn = QToolButton()
-                    del_btn.setText("-")
+                    del_btn.setText("删除模型")
                     try:
-                        del_btn.setFixedSize(self._scale_size(22), self._scale_size(22))
+                        del_btn.setMinimumWidth(self._scale_size(72))
+                        del_btn.setFixedHeight(self._scale_size(26))
                     except Exception:
                         pass
                     del_btn.clicked.connect(lambda _=False, mm=m: self._delete_api_model(mm))
                     row_layout.addWidget(del_btn, 0, Qt.AlignmentFlag.AlignRight)
 
-                    item.setSizeHint(QSize(0, self._scale_size(28)))
+                    item.setSizeHint(QSize(0, self._scale_size(34)))
                     lw.addItem(item)
                     lw.setItemWidget(item, row)
 
@@ -6849,9 +8461,10 @@ class MainWindow(QMainWindow):
             self.config_manager.set("api", "model", model)
         except Exception:
             pass
+        self._save_current_api_provider_state()
         if self._api_enabled and str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
             try:
-                self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
+                self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, provider_type=self._api_provider_type, timeout_sec=30.0)
                 self.translator = self._api_translator
             except Exception:
                 self._api_translator = None
@@ -6883,6 +8496,7 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._save_api_models_to_config()
+        self._save_current_api_provider_state()
         self._refresh_api_models_ui()
         try:
             self.update_translate_button_label()
@@ -6904,9 +8518,10 @@ class MainWindow(QMainWindow):
             self.config_manager.set("api", "model", model)
         except Exception:
             pass
+        self._save_current_api_provider_state()
         if self._api_enabled and str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
             try:
-                self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
+                self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, provider_type=self._api_provider_type, timeout_sec=30.0)
                 self.translator = self._api_translator
             except Exception:
                 self._api_translator = None
@@ -6939,7 +8554,7 @@ class MainWindow(QMainWindow):
             self._unload_local_translator()
             try:
                 if str(self._api_base_url or "").strip() and str(self._api_model or "").strip():
-                    self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, timeout_sec=30.0)
+                    self._api_translator = _ApiTranslator(base_url=self._api_base_url, api_key=self._api_key, model=self._api_model, provider_type=self._api_provider_type, timeout_sec=30.0)
                     self.translator = self._api_translator
                 else:
                     self._api_translator = None

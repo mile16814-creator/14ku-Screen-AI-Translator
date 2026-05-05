@@ -38,6 +38,7 @@ class ConfigManager:
                 'target_process': '',
                 'auto_start': 'false',
                 'py32': '',
+                'renpy_injection': 'true',
                 'prefer_frida_only': 'false',
             },
             'translation': {
@@ -47,6 +48,8 @@ class ConfigManager:
                 # 主界面"4个快捷语言槽位"（默认仍为老4样：英/中(简)/日/韩）
                 # 逗号分隔：en,zh-CN,ja,ko
                 'quick_languages': 'en,zh-CN,ja,ko',
+                'reuse_enabled': 'true',
+                'reuse_db_path': 'config/translation_reuse.db',
             },
             'glossary': {
                 'entries': '',
@@ -105,6 +108,8 @@ class ConfigManager:
             },
             'api': {
                 'enabled': 'false',
+                'provider_key': 'custom',
+                'provider_type': 'openai',
                 'base_url': '',
                 'api_key': '',
                 'model': '',

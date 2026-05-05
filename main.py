@@ -268,7 +268,7 @@ class ScreenTranslatorApp:
         try:
             from PyQt6.QtWidgets import QApplication
             from PyQt6.QtGui import QIcon, QGuiApplication
-            from PyQt6.QtCore import QTranslator, QLibraryInfo, QLocale, Qt
+            from PyQt6.QtCore import QTranslator, QLibraryInfo, QLocale, Qt, qInstallMessageHandler, QtMsgType
         except Exception as e:
             _write_bootstrap_log("Failed to import PyQt6. Exception:")
             _write_bootstrap_log(repr(e))
@@ -280,6 +280,30 @@ class ScreenTranslatorApp:
         self._QTranslator = QTranslator
         self._QLibraryInfo = QLibraryInfo
         self._QLocale = QLocale
+
+        def _qt_message_filter(msg_type, _context, message):
+            try:
+                text = str(message or "")
+            except Exception:
+                text = ""
+            if "QFont::setPointSize: Point size <= 0" in text:
+                return
+            try:
+                if msg_type == QtMsgType.QtWarningMsg:
+                    logging.getLogger("qt").warning(text)
+                elif msg_type == QtMsgType.QtCriticalMsg:
+                    logging.getLogger("qt").critical(text)
+                elif msg_type == QtMsgType.QtFatalMsg:
+                    logging.getLogger("qt").fatal(text)
+                else:
+                    logging.getLogger("qt").info(text)
+            except Exception:
+                pass
+
+        try:
+            qInstallMessageHandler(_qt_message_filter)
+        except Exception:
+            pass
 
         # 高 DPI/多显示器缩放：需在创建 QApplication 之前设置
         try:
@@ -489,6 +513,7 @@ class ScreenTranslatorApp:
                 num_beams = self.config_manager.get_int('local_model', 'num_beams', 1)
                 self.translator = LocalAITranslator(
                     model_path,
+                    load_model_immediately=False,
                     use_cpu=use_cpu,
                     use_fp16=use_fp16,
                     gpu_memory_fraction=gpu_frac,
@@ -496,7 +521,7 @@ class ScreenTranslatorApp:
                 )
                 self.logger.info(
                     f"本地AI翻译器初始化成功，模型路径: {self.translator.model_path} "
-                    f"(CPU={use_cpu}, fp16={use_fp16}, GPU限制={gpu_frac}, beams={num_beams})"
+                    f"(CPU={use_cpu}, fp16={use_fp16}, GPU限制={gpu_frac}, beams={num_beams}, lazy_load=True)"
                 )
             except Exception as e:
                 self.logger.error(f"本地AI翻译器初始化失败: {e}")
